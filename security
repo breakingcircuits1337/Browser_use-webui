@@ -1,0 +1,2122 @@
+import gradio as gr
+import requests
+import nmap
+from playwright.sync_api import sync_playwright
+# from gemini_api import Gemini  # Commented out as the library source is unclear
+import json
+import subprocess
+import logging
+from datetime import datetime
+import tensorflow as tf
+import numpy as np
+import faiss
+import yaml
+from typing import List, Dict, Any, Optional, Tuple, Union
+from io import StringIO
+import time
+import os # Import the os module
+from elevenlabs import Voice, VoiceSettings # Removed play, save, set_api_key from here as they are directly used.
+import elevenlabs # Import the main elevenlabs module to use its functions like set_api_key, generate, save
+
+# Logging Setup
+logging.basicConfig(filename='security_tool.log', level=logging.INFO, # Changed to INFO for less verbose default logging
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- ElevenLabs Configuration ---
+# It's good practice to set the API key early.
+# Ensure your config.yaml has an 'elevenlabs_api_key'
+try:
+    # Temporarily load config here just for the API key, full config load is later
+    with open('config.yaml', 'r') as f_temp_config:
+        temp_config_data = yaml.safe_load(f_temp_config)
+        elevenlabs_api_key = temp_config_data.get('api_keys', {}).get('elevenlabs')
+        if elevenlabs_api_key:
+            elevenlabs.set_api_key(elevenlabs_api_key) # Use elevenlabs.set_api_key
+            logger.info("ElevenLabs API key set.")
+        else:
+            logger.warning("ElevenLabs API key not found in config.yaml. Speech generation will fail.")
+except FileNotFoundError:
+    logger.warning("config.yaml not found. ElevenLabs API key could not be set. Speech generation will fail.")
+except yaml.YAMLError as e:
+    logger.error(f"Error parsing config.yaml for ElevenLabs API key: {e}")
+except Exception as e:
+    logger.error(f"An unexpected error occurred while setting ElevenLabs API key: {e}")
+
+
+# Check GPU availability
+try:
+    logger.info(f"TensorFlow version: {tf.__version__}")
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        logger.info(f"GPU Available: {gpus}")
+        try:
+            # Enable memory growth for GPUs to avoid allocating all memory at once
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            logger.info("GPU memory growth enabled.")
+        except RuntimeError as e:
+            logger.error(f"RuntimeError in enabling memory growth: {e}")
+    else:
+        logger.info("No GPU available, using CPU.")
+except Exception as e:
+    logger.error(f"Error checking GPU availability: {e}")
+
+# Enable mixed precision for better performance (if supported and beneficial)
+# Note: Mixed precision can sometimes cause issues with certain models/layers.
+# Only enable if you've tested it and it provides a benefit.
+# try:
+#     policy = tf.keras.mixed_precision.Policy('mixed_float16')
+#     tf.keras.mixed_precision.set_global_policy(policy)
+#     logger.info("Mixed precision policy 'mixed_float16' set.")
+# except Exception as e:
+#     logger.warning(f"Could not set mixed precision policy: {e}. Continuing with default precision.")
+
+# Configuration
+# Added elevenlabs_api_key to the example YAML structure
+config_yaml = """
+n_vocab: 50000
+n_ctx: 512
+n_embd: 256
+n_head: 8
+n_layer: 6
+learning_rate: 1e-4
+n_hash: 512
+n_quant: 128
+num_results: 5
+dim: 256
+api_key_file: 'config.yaml' # Path to the YAML config file
+"""
+
+try:
+    config = yaml.safe_load(StringIO(config_yaml))
+    logger.info("Internal default configuration loaded.")
+except yaml.YAMLError as e:
+    logger.error(f"Error parsing YAML configuration: {e}")
+    config = {}  # Set to an empty dict to avoid further errors
+
+# Helper Functions
+def gelu(x):
+    """Gaussian Error Linear Unit activation function"""
+    try:
+        return 0.5 * x * (1 + tf.math.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * tf.math.pow(x, 3))))
+    except Exception as e:
+        logging.error(f"Error in gelu function: {e}")
+        return tf.nn.relu(x) # Fallback to ReLU or handle appropriately
+
+# Model Components
+@tf.keras.utils.register_keras_serializable()
+class MultiHeadAttention(tf.keras.layers.Layer):
+    """Multi-head attention layer optimized for Colab"""
+    def __init__(self, n_embd: int, n_head: int, **kwargs): # Added **kwargs
+        super(MultiHeadAttention, self).__init__(**kwargs) # Pass **kwargs
+        self.n_embd = n_embd
+        self.n_head = n_head
+        if n_embd % n_head != 0:
+            raise ValueError(
+                f"Embedding dimension ({n_embd}) must be divisible by the number of heads ({n_head})"
+            )
+        self.head_dim = n_embd // n_head
+
+        initializer = tf.keras.initializers.RandomNormal(stddev=0.02)
+
+        self.c_attn = tf.keras.layers.Dense(3 * n_embd, kernel_initializer=initializer)
+        self.c_proj = tf.keras.layers.Dense(n_embd, kernel_initializer=initializer)
+        self.attn_dropout = tf.keras.layers.Dropout(0.1)
+        self.resid_dropout = tf.keras.layers.Dropout(0.1)
+
+    def split_heads(self, x):
+        batch_size = tf.shape(x)[0]
+        # Correctly reshape for splitting into heads
+        x = tf.reshape(x, (batch_size, -1, self.n_head, self.head_dim))
+        return tf.transpose(x, perm=[0, 2, 1, 3]) # (batch_size, num_heads, seq_len, head_dim)
+
+    def merge_heads(self, x):
+        x = tf.transpose(x, perm=[0, 2, 1, 3]) # (batch_size, seq_len, num_heads, head_dim)
+        batch_size = tf.shape(x)[0]
+        # Correctly reshape for merging heads
+        return tf.reshape(x, (batch_size, -1, self.n_embd))
+
+    def call(self, x, mask=None, training=False):
+        try:
+            qkv = self.c_attn(x)
+            q, k, v = tf.split(qkv, 3, axis=-1)
+
+            q = self.split_heads(q)  # (batch_size, num_heads, seq_len_q, head_dim)
+            k = self.split_heads(k)  # (batch_size, num_heads, seq_len_k, head_dim)
+            v = self.split_heads(v)  # (batch_size, num_heads, seq_len_v, head_dim)
+
+            # Scaled dot-product attention
+            scale = tf.math.sqrt(tf.cast(self.head_dim, q.dtype)) # Use q.dtype for scale
+
+            # Cast q and k to float32 before matrix multiplication if using mixed precision
+            # Or ensure they are compatible types
+            # q_fp32 = tf.cast(q, tf.float32)
+            # k_fp32 = tf.cast(k, tf.float32)
+            # scores = tf.matmul(q_fp32, k_fp32, transpose_b=True) / scale
+            scores = tf.matmul(q, k, transpose_b=True) / scale
+
+
+            if mask is not None:
+                # The mask should be broadcastable to the scores shape.
+                # Typical mask shape for causal attention: (1, 1, seq_len, seq_len)
+                scores += (tf.cast(mask, scores.dtype) * -1e9)
+
+
+            weights = tf.nn.softmax(scores, axis=-1) # Softmax over the last dimension (seq_len_k)
+            weights = self.attn_dropout(weights, training=training)
+
+            # v_fp32 = tf.cast(v, tf.float32) # If weights are float32
+            # attention_output = tf.matmul(weights, v_fp32)
+            attention_output = tf.matmul(weights, v)
+            attention_output = self.merge_heads(attention_output)
+            attention_output = self.c_proj(attention_output)
+            attention_output = self.resid_dropout(attention_output, training=training)
+
+            return attention_output
+        except Exception as e:
+            logging.error(f"Error in MultiHeadAttention.call: {e}", exc_info=True)
+            # Depending on the desired behavior, you might re-raise, return x, or return None
+            return x # Or some other fallback
+
+    def get_config(self): # For Keras model saving/loading
+        config = super().get_config()
+        config.update({
+            "n_embd": self.n_embd,
+            "n_head": self.n_head,
+        })
+        return config
+
+@tf.keras.utils.register_keras_serializable()
+class TransformerBlock(tf.keras.layers.Layer):
+    """Transformer block optimized for Colab"""
+    def __init__(self, n_embd: int, n_head: int, **kwargs): # Added **kwargs
+        super(TransformerBlock, self).__init__(**kwargs) # Pass **kwargs
+        self.n_embd = n_embd
+        self.n_head = n_head
+
+        self.ln_1 = tf.keras.layers.LayerNormalization(epsilon=1e-5)
+        self.attn = MultiHeadAttention(n_embd, n_head)
+        self.ln_2 = tf.keras.layers.LayerNormalization(epsilon=1e-5)
+
+        self.mlp = tf.keras.Sequential([
+            tf.keras.layers.Dense(4 * n_embd, activation=gelu),
+            # tf.keras.layers.Dropout(0.1), # Dropout often placed after activation
+            tf.keras.layers.Dense(n_embd),
+            tf.keras.layers.Dropout(0.1) # Dropout after the second dense layer
+        ])
+
+    def call(self, x, mask=None, training=False):
+        try:
+            # Pre-LayerNorm: x -> ln1 -> attn -> + x
+            attn_output = self.attn(self.ln_1(x), mask=mask, training=training)
+            x = x + attn_output # Residual connection
+
+            # Pre-LayerNorm: x -> ln2 -> mlp -> + x
+            mlp_output = self.mlp(self.ln_2(x), training=training)
+            x = x + mlp_output # Residual connection
+            return x
+        except Exception as e:
+            logging.error(f"Error in TransformerBlock.call: {e}", exc_info=True)
+            return x # Or some other fallback
+
+    def get_config(self): # For Keras model saving/loading
+        config = super().get_config()
+        config.update({
+            "n_embd": self.n_embd,
+            "n_head": self.n_head,
+        })
+        return config
+
+class FAISSRetriever:
+    """Memory-efficient FAISS retriever"""
+    def __init__(self, knowledge_base: List[Dict[str, Any]], dim: int, num_results: int):
+        try:
+            self.index = faiss.IndexFlatL2(dim)
+            self.knowledge_base = knowledge_base
+            self.num_results = min(num_results, len(knowledge_base)) # Ensure num_results isn't too large
+
+            if not knowledge_base: # Handle empty knowledge base
+                logger.warning("FAISSRetriever initialized with an empty knowledge base.")
+                # self.index will be empty, search will return no results
+                return
+
+            vectors = [np.array(doc.get('vector'), dtype=np.float32).reshape(1, -1)
+                       for doc in knowledge_base if doc.get('vector') is not None and np.array(doc.get('vector')).shape == (dim,)]
+
+            if not vectors:
+                logger.warning("No valid vectors found in knowledge_base for FAISSRetriever.")
+                return # self.index will remain empty
+
+            # Ensure all vectors have the correct dimension before concatenating
+            valid_vectors = []
+            for doc in knowledge_base:
+                vec = doc.get('vector')
+                if vec is not None:
+                    np_vec = np.array(vec, dtype=np.float32)
+                    if np_vec.ndim == 1 and np_vec.shape[0] == dim:
+                        valid_vectors.append(np_vec.reshape(1, -1))
+                    elif np_vec.ndim == 2 and np_vec.shape == (1, dim):
+                         valid_vectors.append(np_vec)
+                    else:
+                        logger.warning(f"Skipping vector with incorrect shape: {np_vec.shape}, expected ({dim},) or (1, {dim})")
+            
+            if valid_vectors:
+                self.index.add(np.concatenate(valid_vectors, axis=0))
+            else:
+                logger.warning("No vectors of correct dimension found to add to FAISS index.")
+
+        except Exception as e:
+            logging.error(f"Error initializing FAISSRetriever: {e}", exc_info=True)
+            self.index = None  # Set to None to indicate failure
+            self.knowledge_base = []
+
+
+    def retrieve(self, query_vector: tf.Tensor) -> Optional[tf.Tensor]: # Return type hint
+        try:
+            if self.index is None or self.index.ntotal == 0: # Check if index is valid and has items
+                logger.warning("FAISS index not initialized or empty, cannot retrieve.")
+                return None
+
+            query_np = tf.cast(query_vector, tf.float32).numpy()
+            if query_np.ndim == 1: # Ensure query_np is 2D for FAISS search
+                query_np = np.expand_dims(query_np, axis=0)
+
+            distances, indices = self.index.search(query_np, self.num_results)
+
+            # Handle cases where fewer than num_results are found or indices are -1
+            retrieved_docs_batch = []
+            for batch_indices in indices:
+                doc_texts = []
+                for i in batch_indices:
+                    if i != -1 and i < len(self.knowledge_base): # Check for valid index
+                        doc_texts.append(self.knowledge_base[i]['text'])
+                    # else:
+                        # Optionally, handle invalid indices (e.g., add a placeholder or skip)
+                retrieved_docs_batch.append(doc_texts)
+            
+            # This part needs careful handling if you expect non-rectangular lists
+            # For simplicity, assuming all lists in retrieved_docs_batch will have the same length
+            # (which they should if num_results is consistent and enough docs are present)
+            if not retrieved_docs_batch or not any(retrieved_docs_batch):
+                 return tf.constant([], dtype=tf.string) # Return empty tensor if no docs
+
+            # Pad to make a rectangular tensor if necessary, or handle ragged tensors
+            try:
+                return tf.ragged.constant(retrieved_docs_batch).to_tensor(default_value="")
+            except Exception: # Fallback if ragged tensor conversion fails (e.g. all empty)
+                 # Find max length for padding
+                max_len = 0
+                if retrieved_docs_batch: # Check if not empty
+                    max_len = max(len(docs) for docs in retrieved_docs_batch) if any(retrieved_docs_batch) else 0
+                
+                padded_docs = []
+                for docs in retrieved_docs_batch:
+                    padded_docs.append(docs + [''] * (max_len - len(docs)))
+                return tf.constant(padded_docs, dtype=tf.string)
+
+        except Exception as e:
+            logging.error(f"Error in FAISSRetriever.retrieve: {e}", exc_info=True)
+            return None
+
+
+@tf.keras.utils.register_keras_serializable()
+class MultiModalTransformer(tf.keras.Model):
+    """Colab-optimized MultiModal Transformer"""
+    def __init__(self, model_config: Dict[str, Any], knowledge_base: List[Dict[str, Any]], **kwargs): # Renamed config to model_config, added **kwargs
+        super(MultiModalTransformer, self).__init__(**kwargs) # Pass **kwargs
+        self.model_config = model_config # Use model_config consistently
+
+        try:
+            self.wte = tf.keras.layers.Embedding(model_config['n_vocab'], model_config['n_embd'], name="token_embeddings")
+            self.wpe = tf.keras.layers.Embedding(model_config['n_ctx'], model_config['n_embd'], name="position_embeddings")
+            self.drop = tf.keras.layers.Dropout(0.1)
+
+            self.blocks = [TransformerBlock(model_config['n_embd'], model_config['n_head'], name=f"transformer_block_{i}")
+                           for i in range(model_config['n_layer'])]
+            self.ln_f = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="final_layer_norm")
+
+            # Ensure 'dim' and 'num_results' are in model_config for FAISSRetriever
+            retriever_dim = model_config.get('dim', 256) # Default if not present
+            num_ret_results = model_config.get('num_results', 5) # Default if not present
+            self.retriever = FAISSRetriever(knowledge_base, retriever_dim, num_ret_results)
+
+            self.task_heads = {
+                'text_generation': tf.keras.layers.Dense(model_config['n_vocab'], name="text_generation_head"),
+                'classification': tf.keras.layers.Dense(model_config.get('num_classes', model_config['n_vocab']), activation='softmax', name="classification_head") # Allow specifying num_classes
+            }
+        except KeyError as e:
+            logging.error(f"Missing key in model_config for MultiModalTransformer: {e}", exc_info=True)
+            # Set components to None or raise an error to prevent partial initialization
+            raise ValueError(f"Configuration key error during MultiModalTransformer init: {e}")
+        except Exception as e:
+            logging.error(f"Error initializing MultiModalTransformer: {e}", exc_info=True)
+            raise # Re-raise after logging to indicate critical failure
+
+    def call(self, inputs, task='text_generation', training=False):
+        try:
+            if isinstance(inputs, tuple): # Assuming inputs might be (text_ids, other_modalities)
+                text_ids = inputs[0]
+                # Potentially handle other_modalities here
+            else:
+                text_ids = inputs
+
+            # Input validation
+            if not isinstance(text_ids, (tf.Tensor, np.ndarray)):
+                try:
+                    text_ids = tf.constant(text_ids, dtype=tf.int32)
+                except Exception as e_conv:
+                    logging.error(f"Failed to convert text_ids to tensor: {e_conv}")
+                    raise ValueError("text_ids must be convertible to a tensor of integers.")
+            
+            if text_ids.dtype != tf.int32:
+                 text_ids = tf.cast(text_ids, tf.int32)
+
+
+            # Get embeddings
+            tok_emb = self.wte(text_ids)  # (batch_size, seq_len, n_embd)
+
+            # Add position embeddings
+            # Ensure positions are within the embedding layer's input_dim (n_ctx)
+            seq_len = tf.shape(tok_emb)[1]
+            if seq_len > self.model_config['n_ctx']:
+                logging.warning(f"Input sequence length ({seq_len}) exceeds model context window ({self.model_config['n_ctx']}). Truncating.")
+                tok_emb = tok_emb[:, :self.model_config['n_ctx'], :]
+                seq_len = self.model_config['n_ctx']
+
+            positions = tf.range(0, seq_len, dtype=tf.int32)[tf.newaxis, :] # (1, seq_len)
+            pos_emb = self.wpe(positions) # (1, seq_len, n_embd)
+
+            x = tok_emb + pos_emb
+            x = self.drop(x, training=training)
+
+            # Apply transformer blocks
+            # Causal mask for text generation if needed (autoregressive tasks)
+            # mask = None
+            # if task == 'text_generation':
+            #     mask = self.create_causal_mask(seq_len)
+
+            for block in self.blocks:
+                x = block(x, training=training) # Pass mask if created
+
+            x = self.ln_f(x)
+
+            # Task-specific output
+            if task not in self.task_heads:
+                logging.error(f"Unknown task: {task}. Available tasks: {list(self.task_heads.keys())}")
+                raise ValueError(f"Unknown task: {task}")
+            
+            # If retrieval is part of the task, you might integrate retriever output here
+            # For now, task_heads operate on the transformer output 'x'
+            
+            return self.task_heads[task](x)
+
+        except Exception as e:
+            logging.error(f"Error in MultiModalTransformer.call: {e}", exc_info=True)
+            return None # Or re-raise, or return a specific error indicator
+
+    # def create_causal_mask(self, size):
+    #     mask = 1 - tf.linalg.band_part(tf.ones((size, size)), -1, 0)
+    #     return mask[tf.newaxis, tf.newaxis, :, :] # (1, 1, size, size)
+
+    def get_config(self): # For Keras model saving/loading
+        # Get base config from tf.keras.Model
+        base_config = super().get_config()
+        # Add custom config
+        custom_config = {
+            "model_config": self.model_config,
+            # Knowledge base is not typically part of model's serializable config
+            # It's usually passed during instantiation.
+            # If you need to serialize it, handle it carefully (e.g., path to data)
+        }
+        return {**base_config, **custom_config}
+
+    @classmethod
+    def from_config(cls, config_dict, custom_objects=None):
+        # Separate model_config from the rest of the config_dict
+        # Keras might pass other things in config_dict during deserialization
+        model_config_params = config_dict.pop("model_config", {}) # Default to empty if not found
+        
+        # Knowledge base needs to be handled; it's not in the standard config.
+        # For deserialization, you might need to pass it separately or load it.
+        # Here, we'll assume it's passed or an empty one is acceptable for structure.
+        knowledge_base_for_init = [] # Placeholder
+        
+        return cls(model_config=model_config_params, knowledge_base=knowledge_base_for_init, **config_dict)
+
+
+# Initialize knowledge base
+# Ensure 'dim' from the main 'config' (loaded from YAML string) is used.
+kb_vector_dim = config.get('dim', 256) # Default to 256 if not in config
+knowledge_base = [
+    {'text': f'Example {i}', 'vector': np.random.rand(kb_vector_dim).astype(np.float32)}
+    for i in range(100)
+]
+logger.info(f"Knowledge base initialized with {len(knowledge_base)} items, vector dimension: {kb_vector_dim}.")
+
+
+# Initialize model
+# The 'config' here is the one loaded from the YAML string `config_yaml`
+try:
+    if not config: # If config parsing failed
+        logger.error("Cannot initialize MultiModalTransformer: global config is empty.")
+        model = None
+    else:
+        # Pass the global 'config' as 'model_config' to the transformer
+        model = MultiModalTransformer(model_config=config, knowledge_base=knowledge_base)
+        # Build the model by calling it with sample input if its layers are dynamic
+        # This helps in finalizing weights and shapes.
+        # sample_input_ids = tf.constant([[1, 2, 3]], dtype=tf.int32)
+        # _ = model(sample_input_ids) # Build call
+        logger.info("MultiModalTransformer model initialized.")
+except ValueError as ve: # Catch specific init errors from the model
+    logger.error(f"ValueError during MultiModalTransformer model initialization: {ve}", exc_info=True)
+    model = None
+except Exception as e:
+    logger.error(f"Generic error initializing MultiModalTransformer model: {e}", exc_info=True)
+    model = None
+
+
+# API Integration Functions
+def get_api_key(service_name: str) -> Optional[str]:
+    """
+    Retrieves API keys from the configuration file (config.yaml).
+    """
+    api_key_file_path = config.get('api_key_file', 'config.yaml') # Default to config.yaml
+    try:
+        with open(api_key_file_path, 'r') as f:
+            yaml_config_content = yaml.safe_load(f)
+        
+        # Ensure yaml_config_content is a dictionary
+        if not isinstance(yaml_config_content, dict):
+            logger.error(f"Content of {api_key_file_path} is not a dictionary.")
+            return None
+
+        api_keys_dict = yaml_config_content.get('api_keys', {}) # Expecting a dict of API keys
+        if not isinstance(api_keys_dict, dict):
+            logger.error(f"'api_keys' section in {api_key_file_path} is not a dictionary.")
+            return None
+            
+        key = api_keys_dict.get(service_name)
+        if key is None:
+            # Log this as a warning, the caller can decide if it's an error
+            logger.warning(f"API key for '{service_name}' not found in {api_key_file_path} under 'api_keys'.")
+            return None
+        return str(key) # Ensure it's a string
+    except FileNotFoundError:
+        logger.error(f"API key file not found: {api_key_file_path}")
+        return None # Explicitly return None
+    except yaml.YAMLError as e:
+        logger.error(f"Error reading API key file {api_key_file_path}: {e}", exc_info=True)
+        return None
+    except Exception as e: # Catch any other unexpected errors
+        logger.error(f"Unexpected error retrieving API key for '{service_name}': {e}", exc_info=True)
+        return None
+
+
+def groq_api(prompt: str) -> str:
+    """
+    Sends a prompt to the Groq API and returns the response.
+    """
+    groq_api_key = get_api_key('groq')
+    if not groq_api_key:
+        return "Error: Groq API key not configured."
+
+    # This is a placeholder URL and structure. Adjust to the actual Groq API.
+    # The official Groq API uses a different endpoint for chat completions.
+    # Example for chat completions:
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {groq_api_key}",
+        "Content-Type": "application/json"
+    }
+    # Constructing a more standard payload for chat models
+    payload = {
+        "messages": [
+            {"role": "system", "content": "You are a helpful security assistant."},
+            {"role": "user", "content": prompt}
+        ],
+        "model": "mixtral-8x7b-32768" # Example model, replace with a valid one
+        # Add other parameters like temperature, max_tokens if needed
+    }
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=30) # Added timeout
+        response.raise_for_status() # Raises HTTPError for bad responses (4XX or 5XX)
+        
+        response_json = response.json()
+        # Extract the message content based on typical OpenAI-compatible API structure
+        if response_json.get("choices") and len(response_json["choices"]) > 0:
+            message = response_json["choices"][0].get("message", {})
+            content = message.get("content")
+            if content:
+                return content.strip()
+            else:
+                logger.error(f"Groq API response missing content: {response_json}")
+                return "Error: Groq API response format unexpected (no content)."
+        else:
+            logger.error(f"Groq API response missing choices: {response_json}")
+            return "Error: Groq API response format unexpected (no choices)."
+
+    except requests.exceptions.Timeout:
+        logging.error("Groq API call timed out.")
+        return "Error: Groq API call timed out."
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error calling Groq API: {e}", exc_info=True)
+        return f"Error calling Groq API: {e}"
+    except (KeyError, IndexError, TypeError) as e: # Handle issues with response parsing
+        logging.error(f"Error parsing Groq API response: {e}", exc_info=True)
+        return f"Error parsing Groq API response: {e}"
+    except Exception as e: # Catch-all for other unexpected errors
+        logging.error(f"An unexpected error occurred during Groq API call: {e}", exc_info=True)
+        return f"An unexpected error occurred during Groq API call: {e}"
+
+
+def mistral_api(prompt: str) -> str:
+    """
+    Sends a prompt to the Mistral API and returns the response.
+    """
+    mistral_api_key = get_api_key('mistral')
+    if not mistral_api_key:
+        return "Error: Mistral API key not configured."
+
+    # Corrected URL and payload structure for Mistral API (example)
+    url = "https://api.mistral.ai/v1/chat/completions" # Common endpoint
+    headers = {
+        "Authorization": f"Bearer {mistral_api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    payload = {
+        "model": "mistral-medium", # Or other available model
+        "messages": [
+            {"role": "system", "content": "You are a helpful security assistant."},
+            {"role": "user", "content": prompt}
+        ]
+        # Add other parameters like temperature, max_tokens if needed
+    }
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=30) # Added timeout
+        response.raise_for_status()
+        
+        response_json = response.json()
+        if response_json.get("choices") and len(response_json["choices"]) > 0:
+            message = response_json["choices"][0].get("message", {})
+            content = message.get("content")
+            if content:
+                return content.strip()
+            else:
+                logger.error(f"Mistral API response missing content: {response_json}")
+                return "Error: Mistral API response format unexpected (no content)."
+        else:
+            logger.error(f"Mistral API response missing choices: {response_json}")
+            return "Error: Mistral API response format unexpected (no choices)."
+
+    except requests.exceptions.Timeout:
+        logging.error("Mistral API call timed out.")
+        return "Error: Mistral API call timed out."
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error calling Mistral API: {e}", exc_info=True)
+        return f"Error calling Mistral API: {e}"
+    except (KeyError, IndexError, TypeError) as e:
+        logging.error(f"Error parsing Mistral API response: {e}", exc_info=True)
+        return f"Error parsing Mistral API response: {e}"
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during Mistral API call: {e}", exc_info=True)
+        return f"An unexpected error occurred during Mistral API call: {e}"
+
+# --- ElevenLabs Text-to-Speech Function ---
+def generate_speech_elevenlabs(text_to_speak: str, voice_id: str = "Adam", # Default voice
+                               output_filename: str = "output_speech.mp3") -> Optional[str]:
+    """
+    Generates speech from text using ElevenLabs API and saves it to a file.
+    Returns the path to the audio file or None if an error occurs.
+    Make sure ELEVEN_API_KEY environment variable is set or set_api_key() was called.
+    """
+    if not get_api_key('elevenlabs'): # Check if API key was successfully set/retrieved
+        logger.error("ElevenLabs API key not available. Cannot generate speech.")
+        return None
+    
+    if not text_to_speak or not text_to_speak.strip():
+        logger.warning("No text provided to generate_speech_elevenlabs.")
+        return None
+
+    try:
+        # You can customize voice, model, and voice settings
+        # Example: Voice(voice_id='EXAVITQu4vr4xnSDxMaL') # Specific voice ID
+        # VoiceSettings can be used to adjust stability, similarity_boost, etc.
+        audio = elevenlabs.generate( # Use elevenlabs.generate
+            text=text_to_speak,
+            voice=Voice(
+                voice_id=voice_id, # You can list available voices or use a specific ID
+                # settings=VoiceSettings(stability=0.71, similarity_boost=0.5, style=0.0, use_speaker_boost=True)
+            ),
+            model="eleven_multilingual_v2" # Or other models like "eleven_monolingual_v1"
+        )
+
+        if audio:
+            # Save the audio to a file
+            elevenlabs.save(audio, output_filename) # Use elevenlabs.save
+            logger.info(f"Speech generated and saved to {output_filename}")
+            return output_filename
+        else:
+            logger.error("ElevenLabs audio generation returned no data.")
+            return None
+            
+    except elevenlabs.api.error.APIError as e: # Catch specific ElevenLabs API errors
+        logger.error(f"ElevenLabs API Error: {e}", exc_info=True)
+        if "authentication" in str(e).lower():
+             logger.error("Please check your ElevenLabs API key and account status.")
+        return None
+    except Exception as e:
+        logger.error(f"Error generating speech with ElevenLabs: {e}", exc_info=True)
+        return None
+
+# Port Scanning Function
+def scan_ports(target: str, advanced_scan: bool = False, custom_ports: Optional[str] = None,
+               os_detection: bool = False, service_detection: bool = False) -> Union[Dict, str]:
+    """
+    Scans the target for open ports using nmap.
+    Returns a dictionary of results or an error string.
+    """
+    scanner = nmap.PortScanner()
+    arguments = '-T4' # Default: Faster execution
+
+    # Prioritize advanced_scan if true, as it often includes os/service detection
+    if advanced_scan:
+        arguments += ' -A'  # Enable OS detection, version detection, script scanning, and traceroute
+    else:
+        if custom_ports:
+            # Validate custom_ports format (simple validation)
+            if not all(c.isdigit() or c in ',.-' for c in custom_ports):
+                logger.error(f"Invalid custom_ports format: {custom_ports}")
+                return "Error: Invalid custom ports format. Use numbers, commas, hyphens."
+            arguments += f' -p {custom_ports}'
+        else:
+            arguments += ' -p 1-1024' # Default to common ports if no custom range
+
+        if os_detection:
+            arguments += ' -O'
+        if service_detection: # -sV is often part of -A, but can be specified
+            arguments += ' -sV'
+    
+    logger.info(f"Nmap scan arguments for {target}: '{arguments}'")
+
+    try:
+        # Ensure target is a string and not empty
+        if not isinstance(target, str) or not target.strip():
+            logger.error("Invalid target for port scan: target is empty or not a string.")
+            return "Error: Target for port scan cannot be empty."
+
+        # Basic check if target might be a URL, try to extract hostname
+        if target.startswith(("http://", "https://")):
+            from urllib.parse import urlparse
+            parsed_url = urlparse(target)
+            target_host = parsed_url.hostname
+            if not target_host:
+                logger.error(f"Could not extract hostname from URL: {target}")
+                return f"Error: Could not extract hostname from URL: {target}"
+            logger.info(f"Extracted hostname {target_host} from URL {target} for Nmap scan.")
+        else:
+            target_host = target # Assume it's already a hostname/IP
+
+        # Timeout for nmap scan (e.g., 5 minutes)
+        # nmap.PortScanner() doesn't directly support a timeout in its scan method.
+        # You might need to run nmap as a subprocess to control timeout,
+        # or rely on nmap's own timing options (like -T4).
+        # For simplicity, we'll proceed without explicit Python-level timeout here.
+        
+        scanner.scan(hosts=target_host, arguments=arguments)
+        
+        scan_results_dict = {}
+        scan_info = scanner.scaninfo()
+        scan_results_dict['scan_info'] = scan_info
+        scan_results_dict['command_line'] = scanner.command_line()
+
+        all_hosts = scanner.all_hosts()
+        if not all_hosts:
+            logger.warning(f"Nmap scan on {target_host} yielded no host results. The host might be down or unresponsive.")
+            scan_results_dict['status'] = 'Host down or unresponsive'
+            scan_results_dict['hosts'] = []
+            return scan_results_dict # Return current results, even if host is down
+
+        scan_results_dict['hosts'] = []
+        for host in all_hosts:
+            host_data = {'host': host, 'status': scanner[host].state()}
+            if 'osmatch' in scanner[host] and scanner[host]['osmatch']:
+                host_data['os'] = scanner[host]['osmatch'][0]['name']
+            
+            protocols = scanner[host].all_protocols()
+            host_data['protocols'] = {}
+            for proto in protocols:
+                host_data['protocols'][proto] = []
+                ports = scanner[host][proto].keys()
+                for port in ports:
+                    port_info = scanner[host][proto][port]
+                    host_data['protocols'][proto].append({
+                        'port': port,
+                        'state': port_info['state'],
+                        'name': port_info.get('name', ''),
+                        'product': port_info.get('product', ''),
+                        'version': port_info.get('version', ''),
+                        'extrainfo': port_info.get('extrainfo', ''),
+                        'cpe': port_info.get('cpe', '')
+                    })
+            scan_results_dict['hosts'].append(host_data)
+
+        logger.info(f"Port scan results for {target_host}: {json.dumps(scan_results_dict, indent=2)}")
+        return scan_results_dict
+
+    except nmap.PortScannerError as e:
+        logger.error(f"Nmap PortScannerError for {target}: {e}", exc_info=True)
+        return f"Error scanning ports (nmap engine error): {e}"
+    except KeyError as e: # If nmap output structure is unexpected
+        logger.error(f"Nmap result parsing error for {target}: Missing key {e}", exc_info=True)
+        return f"Error parsing nmap results: {e}"
+    except Exception as e: # Catch-all for other issues
+        logger.error(f"An unexpected error occurred during port scan for {target}: {e}", exc_info=True)
+        return f"An unexpected error occurred during port scan: {e}"
+
+
+# Vulnerability Detection Functions
+def detect_xss(url: str, custom_payload: str = "<script>alert('XSS_Test_Alert_Playwright')</script>") -> str:
+    """
+    Detects basic reflected XSS vulnerabilities by injecting a payload into input fields.
+    This is a very basic check and might not find all XSS vulnerabilities.
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        return "Error: Invalid URL for XSS detection."
+    
+    logger.info(f"Starting XSS detection for URL: {url}")
+    alert_triggered = False
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True) # Ensure headless for automation
+            context = browser.new_context(ignore_https_errors=True) # Ignore HTTPS errors for test sites
+            page = context.new_page()
+
+            # Handler for dialogs (like alert, confirm, prompt)
+            def handle_dialog(dialog):
+                nonlocal alert_triggered
+                logger.info(f"Dialog of type '{dialog.type}' detected with message: '{dialog.message()}'")
+                if dialog.type == 'alert' and "XSS_Test_Alert_Playwright" in dialog.message():
+                    alert_triggered = True
+                dialog.dismiss() # Dismiss the dialog to continue script execution
+
+            page.on('dialog', handle_dialog)
+
+            page.goto(url, timeout=15000) # Increased timeout for page load
+
+            # Attempt to find forms and input fields to inject payload
+            # This is a simplified approach; real-world XSS detection is more complex
+            forms = page.query_selector_all('form')
+            if not forms:
+                # If no forms, try to append payload as a query parameter (very basic)
+                test_url_with_payload = f"{url}?q={requests.utils.quote(custom_payload)}" # Common param 'q', URL encode payload
+                logger.info(f"No forms found, trying XSS via query parameter: {test_url_with_payload}")
+                page.goto(test_url_with_payload, timeout=10000)
+                # Check if alert was triggered by the URL payload itself
+                if alert_triggered:
+                    browser.close()
+                    logger.warning(f"XSS Vulnerability Potentially Detected via URL parameter at {url}")
+                    return "XSS Vulnerability Potentially Detected (via URL parameter)"
+
+
+            for form_idx, form_handle in enumerate(forms):
+                logger.info(f"Testing form {form_idx + 1} on {url}")
+                # Find text/search inputs within this form
+                input_fields = form_handle.query_selector_all('input[type="text"], input[type="search"], textarea')
+                if not input_fields:
+                    logger.info(f"No text/search input fields found in form {form_idx + 1}")
+                    continue
+
+                for input_idx, input_field in enumerate(input_fields):
+                    try:
+                        input_name = input_field.get_attribute('name') or f"unnamed_input_{input_idx}" # REMOVED await
+                        logger.info(f"Attempting to fill input '{input_name}' with XSS payload.")
+                        input_field.fill(custom_payload, timeout=5000) # REMOVED await
+                        
+                        # Try to submit the form
+                        submit_button = form_handle.query_selector('button[type="submit"], input[type="submit"]')
+                        if submit_button:
+                            logger.info("Submitting form with XSS payload.")
+                            # Click and wait for navigation or a timeout if no navigation
+                            try:
+                                with page.expect_navigation(timeout=7000, wait_until="domcontentloaded"):
+                                    submit_button.click() # REMOVED await
+                            except Exception as nav_e: # playwright._impl._api_types.TimeoutError
+                                logger.info(f"No navigation after form submission or timeout: {nav_e}")
+                                # Continue to check for alert even if navigation times out or doesn't occur
+                        else:
+                            # If no submit button, sometimes pressing Enter on an input field submits
+                            logger.info("No explicit submit button, trying to press Enter on the input field.")
+                            input_field.press("Enter", timeout=5000) # REMOVED await
+                            # Wait a bit for potential JS execution
+                            page.wait_for_timeout(1000)
+
+
+                        if alert_triggered:
+                            browser.close()
+                            logger.warning(f"XSS Vulnerability Detected in form {form_idx+1}, input '{input_name}' at {url}")
+                            return f"XSS Vulnerability Detected (in form input: {input_name})"
+                        
+                        # Important: Reset form or navigate back if the state is changed too much
+                        page.goto(url, timeout=10000) # Go back to original URL
+                        alert_triggered = False # Reset for next attempt
+                        # Re-attach dialog handler for the reloaded page
+                        page.on('dialog', handle_dialog) # Re-attach as page reloaded
+                        # Re-query forms as page has reloaded
+                        forms = page.query_selector_all('form') # Re-query forms
+                        if form_idx < len(forms):
+                            form_handle = forms[form_idx] # Update form_handle to the new one
+                        else: # If the number of forms changed or current form disappeared
+                            logger.info("Form structure changed after reload, breaking from XSS form loop.")
+                            break # Break from inner input_fields loop, will re-evaluate outer forms loop
+
+                    except Exception as e_input:
+                        logger.error(f"Error interacting with input field during XSS detection: {e_input}", exc_info=True)
+                        try:
+                            page.goto(url, timeout=10000) # Try to recover state
+                            page.on('dialog', handle_dialog) # Re-attach dialog handler
+                            forms = page.query_selector_all('form') # Re-query forms
+                        except Exception as e_goto:
+                             logger.error(f"Failed to navigate back to URL after error: {e_goto}")
+                             browser.close()
+                             return f"Error during XSS detection (input interaction): {e_input}"
+                if form_idx >= len(forms): # If forms list was changed by reload and we are out of bounds
+                    break
+
+
+            browser.close()
+            if alert_triggered: # Should be caught earlier, but as a final check
+                logger.warning(f"XSS Vulnerability Detected at {url}")
+                return "XSS Vulnerability Detected"
+            else:
+                logger.info(f"No XSS Vulnerability (based on alert '{custom_payload}') Detected at {url}")
+                return "No XSS Vulnerability (based on this specific test) Detected"
+
+    except Exception as e:
+        logger.error(f"Error during XSS detection for {url}: {e}", exc_info=True)
+        return f"Error during XSS detection: {e}"
+
+
+def detect_idor(url: str, user_id_param: str = "id", path_template: str = "/user/{id}") -> str:
+    """
+    Detects very basic IDOR vulnerabilities by trying to access resources with incremented IDs.
+    This is a highly simplified check. Real IDOR detection is context-dependent and complex.
+    Assumes session cookies from the first request might be used for subsequent ones.
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        return "Error: Invalid URL for IDOR detection."
+
+    logger.info(f"Starting IDOR detection for URL: {url}, path_template: {path_template}")
+    base_url = url.strip('/') # Remove trailing slash for consistent joining
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            # Create a context that will persist cookies
+            context = browser.new_context(ignore_https_errors=True)
+            page = context.new_page()
+
+            # --- Scenario 1: Accessing user profiles/data via path ---
+            # Attempt to access resource for user 1 (assuming it exists and user has access)
+            target_url_user1 = f"{base_url}{path_template.format(id=1)}"
+            logger.info(f"IDOR Test: Accessing {target_url_user1} (User 1)")
+            try:
+                response_user1 = page.goto(target_url_user1, timeout=10000)
+                if response_user1 is None: # Should not happen with goto, but check
+                    logger.warning(f"No response object for {target_url_user1}")
+                    content_user1 = ""
+                    status_user1 = 0
+                else:
+                    content_user1 = page.content() # REMOVED await
+                    status_user1 = response_user1.status
+                    logger.info(f"User 1 ({target_url_user1}) - Status: {status_user1}")
+            except Exception as e1:
+                logger.warning(f"Could not access {target_url_user1}: {e1}")
+                content_user1 = "" # Mark as inaccessible or errored
+                status_user1 = 0 # Indicate error or inaccessibility
+
+            # Attempt to access resource for user 2 (potential IDOR if successful and content differs)
+            target_url_user2 = f"{base_url}{path_template.format(id=2)}"
+            logger.info(f"IDOR Test: Accessing {target_url_user2} (User 2)")
+            try:
+                response_user2 = page.goto(target_url_user2, timeout=10000)
+                if response_user2 is None:
+                    logger.warning(f"No response object for {target_url_user2}")
+                    content_user2 = ""
+                    status_user2 = 0
+                else:
+                    content_user2 = page.content() # REMOVED await
+                    status_user2 = response_user2.status
+                    logger.info(f"User 2 ({target_url_user2}) - Status: {status_user2}")
+            except Exception as e2:
+                logger.warning(f"Could not access {target_url_user2}: {e2}")
+                content_user2 = ""
+                status_user2 = 0
+            
+            browser.close()
+
+            # Analyze results for path-based IDOR
+            if status_user1 == 200 and status_user2 == 200:
+                # Simple content diff; more sophisticated diffing might be needed
+                if content_user1 != content_user2 and content_user1 and content_user2:
+                    # Check for common "unauthorized" messages in user2's content
+                    unauth_keywords = ["unauthorized", "access denied", "forbidden", "please login"]
+                    if not any(keyword in content_user2.lower() for keyword in unauth_keywords):
+                        logger.warning(f"Potential IDOR Detected (Path): Accessed different user data for ID 1 and 2. URL: {base_url}, Template: {path_template}")
+                        return f"Potential IDOR Detected (Path): Accessed different user data ({path_template.format(id=1)} vs {path_template.format(id=2)})."
+                elif content_user1 == content_user2 and content_user1: # Same content could also be an issue
+                    logger.info(f"IDOR Check (Path): Content for user 1 and 2 is identical. This might be normal or an issue depending on context. URL: {base_url}{path_template}")
+                    # This is ambiguous without more context.
+
+            elif status_user1 == 200 and status_user2 != 200 and status_user2 != 0:
+                logger.info(f"IDOR Check (Path): User 1 accessible (Status {status_user1}), User 2 not (Status {status_user2}). This is likely secure behavior. URL: {base_url}{path_template}")
+                return "No obvious IDOR (Path): Access to different user ID was correctly restricted."
+            
+            # --- Scenario 2: Accessing resources via query parameter (e.g., ?user_id=1) ---
+            # This would require identifying forms or links that use such parameters.
+            # For simplicity, this basic check focuses on path-based IDOR.
+            # A more advanced check would:
+            # 1. Spider the site for URLs with numeric IDs in query params.
+            # 2. Log in as User A, access their resource (e.g., /orders?id=100).
+            # 3. Try to access User B's resource by changing the ID (e.g., /orders?id=101).
+
+            logger.info(f"No clear IDOR (Path-based) detected with template {path_template} at {url}")
+            return "No clear IDOR (based on this specific path test) Detected"
+
+    except Exception as e:
+        logger.error(f"Error during IDOR detection for {url}: {e}", exc_info=True)
+        return f"Error during IDOR detection: {e}"
+
+
+def run_nikto_scan(url: str) -> str:
+    """
+    Runs a Nikto scan against the target URL.
+    Nikto must be installed and in the system's PATH.
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        return "Error: Invalid URL for Nikto scan."
+        
+    logger.info(f"Starting Nikto scan for URL: {url}")
+    try:
+        # Basic command: nikto -h <url>
+        # Add -Tuning x to reduce false positives or control scan intensity if needed.
+        # Example: -Tuning 1 (Interesting File / Seen in Log), 2 (Misconfiguration / Default File)
+        # For a general scan, default tuning is often okay.
+        # Adding -Format txt to ensure text output, though it's often default.
+        # Adding -ask no to auto-proceed on questions.
+        command = ["nikto", "-h", url, "-Format", "txt", "-ask", "no", "-Tuning", "x6"] # x6 for generic, can be tuned
+        
+        # Increased timeout for Nikto as it can be slow
+        result = subprocess.run(command, capture_output=True, text=True, timeout=300) # 5 minutes timeout
+
+        if result.returncode == 0:
+            logger.info(f"Nikto scan completed for {url}. Output length: {len(result.stdout)}")
+            # Nikto output can be very verbose. Consider summarizing or highlighting critical findings.
+            # For now, returning the full output.
+            return result.stdout
+        else:
+            logger.error(f"Nikto scan for {url} failed with return code {result.returncode}. Error: {result.stderr}")
+            return f"Nikto scan failed. Return code: {result.returncode}\nError: {result.stderr}\nOutput: {result.stdout}"
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"Nikto scan timed out for {url} after 300 seconds.")
+        return f"Nikto scan timed out for {url}."
+    except FileNotFoundError:
+        logger.error("Nikto command not found. Please ensure Nikto is installed and in your PATH.")
+        return "Error: Nikto command not found. Is it installed and in PATH?"
+    except Exception as e:
+        logger.error(f"Error running Nikto on {url}: {e}", exc_info=True)
+        return f"Error running Nikto: {e}"
+
+
+def test_sql_injection(url: str) -> str:
+    """
+    Tests a website for basic SQL Injection vulnerabilities by trying common payloads in input fields.
+    This is a very basic check.
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        return "Error: Invalid URL for SQL Injection test."
+
+    logger.info(f"Starting SQL Injection test for URL: {url}")
+    # Payloads from the original script, can be expanded
+    payloads = [
+        "'", "\"", "`", # Basic quotes
+        "1' OR '1'='1", "1\" OR \"1\"=\"1", "1` OR `1`=`1", # Simple boolean-based
+        "' OR '1'='1' -- ", "\" OR \"1\"=\"1\" -- ", "` OR `1`=`1` -- ", # With comments
+        "' OR '1'='1' ({", "' OR '1'='1' /*", # More comment styles
+        "admin'--", "admin' #", "admin'/*",
+        "1' UNION SELECT null, @@version -- ", # Basic UNION-based (MySQL example)
+        "SLEEP(5)", "1' AND SLEEP(5) --", # Time-based (MySQL example)
+        "'; EXEC xp_cmdshell('dir') --", # Command execution (SQL Server example - highly dangerous) - USE WITH EXTREME CAUTION
+    ]
+    # More cautious payloads (less likely to cause issues but still indicative)
+    cautious_payloads = [
+        "'", "\"", # Basic quotes
+        "1' OR '1'='1", "1\" OR \"1\"=\"1", # Simple boolean-based
+        "' OR TRUE --", "\" OR TRUE --",
+        "1 AND 1=1", "1 AND 1=2" # Basic logic tests
+    ]
+    # Common SQL error patterns to look for in response content
+    sql_error_patterns = [
+        "you have an error in your sql syntax", "warning: mysql", "unclosed quotation mark",
+        "odbc drivers error", "invalid input syntax for type", "ora-", "pg_query()",
+        "microsoft ole db provider for sql server", "cfsql", "syntax error"
+    ]
+
+    vulnerability_found = False
+    problematic_payload = ""
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(ignore_https_errors=True)
+            page = context.new_page()
+
+            page.goto(url, timeout=15000)
+
+            forms = page.query_selector_all('form')
+            if not forms:
+                logger.info(f"No forms found on {url} to test for SQLi.")
+                # Could also test query parameters here if desired.
+                # Example: for param_name in ["id", "search", "query"]:
+                #    for payload in cautious_payloads:
+                #        test_url = f"{url}?{param_name}={requests.utils.quote(payload)}"
+                #        page.goto(test_url) ... check content ...
+                browser.close()
+                return "No forms found to test for SQL Injection."
+
+
+            for form_idx, form_handle in enumerate(forms):
+                if vulnerability_found: break # Stop if already found
+                logger.info(f"Testing form {form_idx + 1} on {url} for SQLi.")
+                
+                input_fields = form_handle.query_selector_all(
+                    'input[type="text"], input[type="search"], input[type="email"], input[type="password"], textarea'
+                )
+                if not input_fields: continue
+
+                for input_idx, input_field in enumerate(input_fields):
+                    if vulnerability_found: break
+                    try:
+                        input_name = input_field.get_attribute('name') or f"unnamed_input_{input_idx}" # REMOVED await
+                        
+                        for payload_idx, payload in enumerate(cautious_payloads): # Use cautious payloads
+                            logger.debug(f"Testing payload '{payload}' in input '{input_name}' of form {form_idx+1}")
+                            
+                            # Reload page or reset form before each payload injection attempt
+                            page.goto(url, timeout=10000) # Go back to original URL
+                            forms_refreshed = page.query_selector_all('form') # Re-find forms
+                            if form_idx >= len(forms_refreshed): break 
+                            current_form_handle = forms_refreshed[form_idx]
+                            current_inputs = current_form_handle.query_selector_all(
+                                'input[type="text"], input[type="search"], input[type="email"], input[type="password"], textarea'
+                            )
+                            if input_idx >= len(current_inputs): break 
+                            current_input_field = current_inputs[input_idx]
+
+                            current_input_field.fill(payload, timeout=3000) # REMOVED await
+                            
+                            submit_button = current_form_handle.query_selector('button[type="submit"], input[type="submit"]')
+                            page_content_after_submit = "" # Initialize
+                            if submit_button:
+                                try:
+                                    # Use promise.all to wait for either navigation or response
+                                    # This helps catch errors even if page doesn't fully navigate
+                                    with page.expect_response(lambda resp: True, timeout=7000) as resp_info: # Catch any response
+                                        submit_button.click() # REMOVED await
+                                    response = resp_info.value # REMOVED await
+                                    page_content_after_submit = page.content() # REMOVED await
+                                    response_status = response.status
+                                except Exception as submit_e: # playwright._impl._api_types.TimeoutError or other
+                                    logger.warning(f"Timeout or error during form submission with payload '{payload}': {submit_e}")
+                                    page_content_after_submit = page.content() # REMOVED await # Get content anyway
+                                    response_status = 0 # Indicate potential issue
+                            else: # No submit button, try pressing Enter
+                                current_input_field.press("Enter", timeout=5000) # REMOVED await
+                                page.wait_for_timeout(1000) # Wait for JS
+                                page_content_after_submit = page.content() # REMOVED await
+                                response_status = page.evaluate("() => window.performance.getEntriesByType('navigation')[0]?.responseStatus || 200") # Heuristic
+
+                            # Check for SQL error messages in the content
+                            if page_content_after_submit: # Ensure content was fetched
+                                for error_pattern in sql_error_patterns:
+                                    if error_pattern.lower() in page_content_after_submit.lower():
+                                        logger.warning(f"Potential SQL Injection Vulnerability Detected with payload: '{payload}' in input '{input_name}' at {url}. Error pattern: '{error_pattern}'")
+                                        vulnerability_found = True
+                                        problematic_payload = payload
+                                        break
+                            if vulnerability_found: break
+                        
+                        # Simple logic change test (e.g., 1=1 vs 1=2)
+                        # This is more complex and requires comparing responses carefully.
+                        # For this basic script, we'll rely on error messages.
+
+                    except Exception as e_input_sqli:
+                        logger.error(f"Error interacting with input field during SQLi test: {e_input_sqli}", exc_info=True)
+                        try:
+                            page.goto(url, timeout=10000) # Recover
+                            forms_refreshed = page.query_selector_all('form') # Re-query forms
+                        except Exception:
+                            logger.error("Failed to recover by navigating to base URL in SQLi test.")
+                            break 
+                if form_idx >= len(forms_refreshed if 'forms_refreshed' in locals() else forms): break
+
+
+            browser.close()
+            if vulnerability_found:
+                return f"Potential SQL Injection Vulnerability Detected (with payload: '{problematic_payload}')"
+            else:
+                logger.info(f"No obvious SQL Injection Vulnerability (based on error messages) Detected at {url}")
+                return "No SQL Injection Vulnerability (based on this specific test) Detected"
+
+    except Exception as e:
+        logger.error(f"Error testing for SQL Injection at {url}: {e}", exc_info=True)
+        return f"Error testing for SQL Injection: {e}"
+
+
+def test_command_injection(url: str) -> str:
+    """
+    Tests a website for basic Command Injection vulnerabilities.
+    This is a very basic check and EXTREMELY DANGEROUS. Use with caution on systems you own.
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        return "Error: Invalid URL for Command Injection test."
+
+    logger.info(f"Starting Command Injection test for URL: {url}")
+    # Payloads that attempt to reveal command execution.
+    # These are common but results depend on OS and how commands are handled by the web app.
+    # Using `ping` or `sleep` for time-based detection is safer than `ls` or `whoami` for initial checks.
+    # For non-time-based, we need to look for output.
+    # Example: `echo CMD_INJ_TEST_STRING` and look for "CMD_INJ_TEST_STRING" in output.
+    
+    # Payloads for *NIX-like systems:
+    nix_payloads = [
+        "; echo CMD_INJ_TEST_NIX_OUTPUT",       # Basic echo
+        "| echo CMD_INJ_TEST_NIX_OUTPUT",      # Pipe echo
+        "&& echo CMD_INJ_TEST_NIX_OUTPUT",     # Logical AND echo
+        "$(echo CMD_INJ_TEST_NIX_OUTPUT)",     # Command substitution
+        "`echo CMD_INJ_TEST_NIX_OUTPUT`",      # Backticks substitution
+        # Payloads that might show up in common ways if `ls` or `id` is run:
+        "; id", "| id",
+        "; ls -la /tmp", "| ls -la /tmp" 
+    ]
+    # Payloads for Windows systems:
+    win_payloads = [
+        "& echo CMD_INJ_TEST_WIN_OUTPUT",       # Basic echo
+        "| echo CMD_INJ_TEST_WIN_OUTPUT",      # Pipe echo (less common for direct output like this)
+        "&& echo CMD_INJ_TEST_WIN_OUTPUT",     # Logical AND echo
+        # Payloads that might show up if `dir` or `whoami` is run:
+        "& whoami", "| whoami",
+        "& dir c:\\", "| dir c:\\"
+    ]
+    
+    # Combine payloads for broader testing, or select based on suspected target OS
+    test_payloads = nix_payloads + win_payloads 
+    
+    # Expected output markers
+    success_markers = [
+        "CMD_INJ_TEST_NIX_OUTPUT", "CMD_INJ_TEST_WIN_OUTPUT", # For echo tests
+        "uid=", "gid=", "groups=", # For 'id' command (Linux)
+        "total ", "drwx", ".bashrc", # For 'ls -la' (Linux, indicative)
+        "Directory of", "<DIR>", # For 'dir' command (Windows)
+        # For 'whoami' (Windows - often shows domain\user or computername\user)
+        # This is harder to make generic, but presence of backslash in a short string might be a hint.
+    ]
+
+    vulnerability_found = False
+    problematic_payload = ""
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(ignore_https_errors=True)
+            page = context.new_page()
+            page.goto(url, timeout=15000)
+
+            forms = page.query_selector_all('form')
+            if not forms:
+                logger.info(f"No forms found on {url} to test for Command Injection.")
+                browser.close()
+                return "No forms found to test for Command Injection."
+
+            for form_idx, form_handle in enumerate(forms):
+                if vulnerability_found: break
+                logger.info(f"Testing form {form_idx + 1} on {url} for Command Injection.")
+                
+                input_fields = form_handle.query_selector_all(
+                    'input[type="text"], input[type="search"], textarea' # Common targets
+                )
+                if not input_fields: continue
+
+                for input_idx, input_field in enumerate(input_fields):
+                    if vulnerability_found: break
+                    try:
+                        input_name = input_field.get_attribute('name') or f"unnamed_input_{input_idx}" # REMOVED await
+                        
+                        for payload in test_payloads:
+                            logger.debug(f"Testing payload '{payload}' in input '{input_name}' of form {form_idx+1}")
+                            
+                            # Reload page/form state
+                            page.goto(url, timeout=10000)
+                            forms_refreshed = page.query_selector_all('form')
+                            if form_idx >= len(forms_refreshed): break
+                            current_form_handle = forms_refreshed[form_idx]
+                            current_inputs = current_form_handle.query_selector_all(
+                                'input[type="text"], input[type="search"], textarea'
+                            )
+                            if input_idx >= len(current_inputs): break
+                            current_input_field = current_inputs[input_idx]
+
+                            current_input_field.fill(payload, timeout=3000) # REMOVED await
+                            
+                            submit_button = current_form_handle.query_selector('button[type="submit"], input[type="submit"]')
+                            page_content_after_submit = "" # Initialize
+                            if submit_button:
+                                try:
+                                    with page.expect_response(lambda resp: True, timeout=7000):
+                                        submit_button.click() # REMOVED await
+                                    page_content_after_submit = page.content() # REMOVED await
+                                except Exception: # Timeout or other error
+                                    page_content_after_submit = page.content() # REMOVED await # Get content anyway
+                            else: # No submit button
+                                current_input_field.press("Enter", timeout=5000) # REMOVED await
+                                page.wait_for_timeout(1000) # Wait for JS
+                                page_content_after_submit = page.content() # REMOVED await
+
+                            # Check for success markers in the response content
+                            if page_content_after_submit: # Ensure content was fetched
+                                for marker in success_markers:
+                                    if marker.lower() in page_content_after_submit.lower():
+                                        # More specific check for 'whoami' on Windows if marker is just '\'
+                                        if marker == "\\" and not any(kw in page_content_after_submit for kw in ["Program Files", "Windows", "Users"]):
+                                            continue 
+                                        
+                                        logger.warning(f"Potential Command Injection Vulnerability Detected with payload: '{payload}' in input '{input_name}' at {url}. Marker: '{marker}'")
+                                        vulnerability_found = True
+                                        problematic_payload = payload
+                                        break
+                            if vulnerability_found: break
+                    except Exception as e_input_cmdi:
+                        logger.error(f"Error interacting with input field during Command Injection test: {e_input_cmdi}", exc_info=True)
+                        try:
+                            page.goto(url, timeout=10000) # Recover
+                            forms_refreshed = page.query_selector_all('form') # Re-query forms
+                        except:
+                            break 
+                if form_idx >= len(forms_refreshed if 'forms_refreshed' in locals() else forms): break
+
+
+            browser.close()
+            if vulnerability_found:
+                return f"Potential Command Injection Vulnerability Detected (with payload: '{problematic_payload}')"
+            else:
+                logger.info(f"No obvious Command Injection Vulnerability (based on output markers) Detected at {url}")
+                return "No Command Injection Vulnerability (based on this specific test) Detected"
+
+    except Exception as e:
+        logger.error(f"Error testing for Command Injection at {url}: {e}", exc_info=True)
+        return f"Error testing for Command Injection: {e}"
+
+
+def run_spider(url: str, max_depth: int = 2, max_links_per_page: int = 20) -> Union[List[str], str]:
+    """
+    Crawls the website up to a certain depth and returns discovered unique links
+    belonging to the same domain.
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        return "Error: Invalid URL for spidering."
+
+    logger.info(f"Starting spider for URL: {url} (max_depth: {max_depth})")
+    
+    try:
+        from urllib.parse import urlparse, urljoin
+        
+        # Normalize base URL to ensure consistent comparison
+        parsed_base_url = urlparse(url)
+        base_domain = parsed_base_url.netloc
+        
+        # Use a set to store unique discovered URLs to avoid re-crawling and duplicates
+        discovered_urls = set()
+        # Use a list of tuples for the queue: (url_to_crawl, current_depth)
+        queue = [(url, 0)]
+        # Store all collected links that belong to the same domain
+        collected_domain_links = set()
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (compatible; SecurityAuditBot/1.0; +http://example.com/bot)", # Example UA
+                ignore_https_errors=True,
+                java_script_enabled=True # Enable JS to discover more links
+            )
+            page = context.new_page()
+
+            while queue:
+                current_url, current_depth = queue.pop(0)
+
+                if current_url in discovered_urls or current_depth > max_depth:
+                    continue
+                
+                discovered_urls.add(current_url)
+                parsed_current_url = urlparse(current_url)
+
+                # Only crawl URLs from the same (sub)domain
+                if parsed_current_url.netloc != base_domain:
+                    logger.debug(f"Skipping external URL: {current_url}")
+                    continue
+                
+                collected_domain_links.add(current_url) # Add to our collection
+                logger.info(f"Spidering [Depth {current_depth}]: {current_url}")
+
+                try:
+                    page.goto(current_url, timeout=15000, wait_until="domcontentloaded") # Wait for DOM
+                    page.wait_for_timeout(1000) # Allow some time for JS to execute and potentially add links
+
+                    # Extract links (href attributes from <a> tags)
+                    link_elements = page.query_selector_all('a[href]')
+                    
+                    links_on_page_count = 0
+                    for link_el in link_elements:
+                        if links_on_page_count >= max_links_per_page and current_depth < max_depth : # Limit links per page for deeper levels
+                            break
+
+                        href = link_el.get_attribute('href') # REMOVED await
+                        if href:
+                            # Resolve relative URLs to absolute URLs
+                            absolute_url = urljoin(current_url, href.strip())
+                            # Normalize URL (e.g., remove fragment)
+                            parsed_absolute_url = urlparse(absolute_url)
+                            normalized_url = parsed_absolute_url._replace(fragment="").geturl()
+
+                            # Add to queue if it's a new URL and within the same domain
+                            if normalized_url not in discovered_urls and urlparse(normalized_url).netloc == base_domain:
+                                queue.append((normalized_url, current_depth + 1))
+                                links_on_page_count +=1
+                                
+                except Exception as e_page:
+                    logger.warning(f"Error spidering page {current_url}: {e_page}")
+                    # Continue with other URLs in the queue
+            
+            browser.close()
+            
+        final_links = sorted(list(collected_domain_links))
+        logger.info(f"Spider finished for {url}. Discovered {len(final_links)} unique domain links.")
+        return final_links
+
+    except ImportError:
+        logger.error("Required 'urllib.parse' module not found, which is strange for standard Python.")
+        return "Error: Core Python module missing."
+    except Exception as e:
+        logger.error(f"Error running spider on {url}: {e}", exc_info=True)
+        return f"Error running spider: {e}"
+
+
+# Browser Automation and Vision
+def take_screenshot(url: str, output_filename: str = "screenshot.png") -> Optional[str]:
+    """
+    Navigates to the URL and captures a screenshot, saving it to a file.
+    Returns the path to the screenshot file or None on error.
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        logger.error("Invalid URL for screenshot.")
+        return None
+        
+    logger.info(f"Taking screenshot for URL: {url}")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={'width': 1280, 'height': 720}, # Default viewport size
+                ignore_https_errors=True
+            )
+            page = context.new_page()
+            page.goto(url, timeout=20000, wait_until="networkidle") # Wait until network is idle for better screenshots
+            
+            # Ensure the directory for screenshots exists if a path is included
+            output_dir = os.path.dirname(output_filename)
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+
+            page.screenshot(path=output_filename, full_page=True) # Capture full page
+            browser.close()
+            logger.info(f"Screenshot taken for {url} and saved to {output_filename}")
+            return output_filename
+    except Exception as e:
+        logger.error(f"Error capturing screenshot for {url}: {e}", exc_info=True)
+        return None # Return None to indicate error
+
+
+# Autonomous Tool Generation (Placeholder - LLM dependent)
+def generate_tool(task_description: str) -> str:
+    """
+    Generates a Python function to accomplish a given task using an LLM (e.g., Groq).
+    This is a conceptual function; actual implementation depends heavily on LLM capabilities.
+    """
+    logger.info(f"Attempting to generate tool for task: {task_description}")
+    # The prompt needs to be carefully engineered.
+    prompt = (
+        f"You are a helpful AI assistant that generates Python code. "
+        f"Please generate a single, self-contained Python function that accomplishes the following task: "
+        f"'{task_description}'. "
+        f"The function should not rely on external non-standard libraries unless explicitly stated or trivial. "
+        f"Include necessary imports within or just before the function if they are standard libraries. "
+        f"Provide only the Python code for the function, including its definition. "
+        f"Ensure the code is well-commented."
+        f"\n\nExample of a simple task: 'Write a Python function to add two numbers.'\n"
+        f"Example expected output:\n"
+        f"```python\n"
+        f"# Function to add two numbers\n"
+        f"def add_numbers(a, b):\n"
+        f"    \"\"\"Adds two numbers and returns the result.\"\"\"\n"
+        f"    return a + b\n"
+        f"```\n\n"
+        f"Now, generate the function for the task: '{task_description}'"
+    )
+    
+    # Using Groq as an example LLM provider
+    tool_code_response = groq_api(prompt)
+
+    if tool_code_response and not tool_code_response.startswith("Error:"):
+        # Basic extraction of Python code block if LLM wraps it in markdown
+        if "```python" in tool_code_response:
+            tool_code = tool_code_response.split("```python\n", 1)[-1].split("```", 1)[0]
+        elif "```" in tool_code_response: # More generic markdown block
+             tool_code = tool_code_response.split("```\n", 1)[-1].split("```", 1)[0]
+        else:
+            tool_code = tool_code_response # Assume raw code if no markdown
+
+        logger.info(f"Generated tool code (raw): \n{tool_code_response}")
+        logger.info(f"Extracted tool code: \n{tool_code}")
+        return tool_code.strip()
+    else:
+        logger.error(f"Failed to generate tool using Groq. Response: {tool_code_response}")
+        return f"Error: Could not generate tool. LLM response: {tool_code_response}"
+
+
+# Security Analysis and Patching
+def analyze_and_patch(url: str, advanced_nmap_scan: bool = False, custom_nmap_ports: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Performs security analysis and suggests patches for detected vulnerabilities.
+    """
+    logger.info(f"Starting comprehensive analysis for URL: {url}")
+    scan_results = {}
+
+    # --- Perform Scans ---
+    logger.info("Running Port Scan...")
+    scan_results["Port Scan"] = scan_ports(url, advanced_scan=advanced_nmap_scan, custom_ports=custom_nmap_ports)
+    
+    logger.info("Running XSS Detection...")
+    scan_results["XSS Detection"] = detect_xss(url)
+    
+    logger.info("Running IDOR Detection...")
+    # For IDOR, you might need more context or common user paths.
+    # Example: if it's a known app structure like /users/{id} or /profile.php?id=
+    scan_results["IDOR Detection"] = detect_idor(url, path_template="/profile?id={id}") # Example path
+    
+    logger.info("Running Nikto Scan...")
+    scan_results["Nikto Scan"] = run_nikto_scan(url)
+    
+    logger.info("Running SQL Injection Test...")
+    scan_results["SQL Injection Detection"] = test_sql_injection(url)
+    
+    logger.info("Running Command Injection Test...")
+    scan_results["Command Injection Detection"] = test_command_injection(url)
+    
+    logger.info("Running Web Crawler/Spider...")
+    scan_results["Web Crawler"] = run_spider(url, max_depth=1) # Limit depth for speed in this context
+
+    # --- Generate Patches/Suggestions using LLM ---
+    vulnerabilities_for_patching = []
+    if isinstance(scan_results["XSS Detection"], str) and "Vulnerability Detected" in scan_results["XSS Detection"]:
+        vulnerabilities_for_patching.append(f"XSS Vulnerability: {scan_results['XSS Detection']}")
+    if isinstance(scan_results["IDOR Detection"], str) and "Vulnerability Detected" in scan_results["IDOR Detection"]:
+        vulnerabilities_for_patching.append(f"IDOR Vulnerability: {scan_results['IDOR Detection']}")
+    if isinstance(scan_results["SQL Injection Detection"], str) and "Vulnerability Detected" in scan_results["SQL Injection Detection"]:
+        vulnerabilities_for_patching.append(f"SQL Injection Vulnerability: {scan_results['SQL Injection Detection']}")
+    if isinstance(scan_results["Command Injection Detection"], str) and "Vulnerability Detected" in scan_results["Command Injection Detection"]:
+        vulnerabilities_for_patching.append(f"Command Injection Vulnerability: {scan_results['Command Injection Detection']}")
+
+    # Summarize Nikto findings for patching (this is very basic, Nikto output is complex)
+    if isinstance(scan_results["Nikto Scan"], str) and "0 error(s)" not in scan_results["Nikto Scan"] and not scan_results["Nikto Scan"].startswith("Error:"):
+        nikto_summary_prompt = (
+            f"The following is a Nikto scan output for {url}. "
+            f"Please summarize up to 3 critical or high severity vulnerabilities mentioned that need patching. "
+            f"If no clear vulnerabilities, state that. Output:\n{scan_results['Nikto Scan'][:2000]}" # Limit length
+        )
+        nikto_vuln_summary = groq_api(nikto_summary_prompt)
+        if nikto_vuln_summary and not nikto_vuln_summary.startswith("Error:"):
+            vulnerabilities_for_patching.append(f"Nikto Scan Highlights: {nikto_vuln_summary}")
+
+
+    patch_suggestions = {}
+    if vulnerabilities_for_patching:
+        patch_prompt = (
+            f"For the website {url}, the following vulnerabilities were detected:\n"
+            + "\n".join(vulnerabilities_for_patching)
+            + "\n\nPlease provide concise, actionable patch suggestions or mitigation strategies for each. "
+            "Structure your response clearly, addressing each vulnerability type found. "
+            "For example: 'For XSS: Implement context-aware output encoding...'"
+        )
+        logger.info("Generating patch suggestions via LLM...")
+        suggestions = groq_api(patch_prompt)
+        if suggestions and not suggestions.startswith("Error:"):
+            patch_suggestions["LLM Suggestions"] = suggestions
+        else:
+            patch_suggestions["LLM Suggestions"] = f"Could not generate patch suggestions. LLM Error: {suggestions}"
+    else:
+        patch_suggestions["LLM Suggestions"] = "No specific vulnerabilities identified for LLM patching suggestions based on automated tests."
+    
+    scan_results["Patch Suggestions"] = patch_suggestions
+
+
+    # --- LLM Model Inference (Example) ---
+    # This part is highly dependent on your specific MultiModalTransformer model's purpose.
+    # The example input and task are placeholders.
+    llm_result_str = "LLM model was not initialized or inference failed."
+    if model is not None: # Check if the model was initialized correctly
+        try:
+            # Example: Create a summary of findings for the LLM to process
+            findings_summary_for_llm = f"Security scan for {url}. Key findings: "
+            if "Vulnerability Detected" in scan_results.get("XSS Detection", ""): findings_summary_for_llm += "XSS found. "
+            if "Vulnerability Detected" in scan_results.get("SQL Injection Detection", ""): findings_summary_for_llm += "SQLi found. "
+            # This needs a tokenizer appropriate for your model
+            # For simplicity, let's assume a dummy tokenization or direct string processing if your model handles it.
+            # This is a placeholder for actual tokenization and input prep.
+            # You'd typically use a tokenizer (e.g., from Hugging Face's tokenizers library)
+            # that matches the one used to train your 'n_vocab' embedding layer.
+            
+            # Placeholder: if your model expects token IDs, you need a vocabulary and tokenizer.
+            # For now, this part will likely not work without a proper tokenizer setup.
+            # Let's assume a dummy input for structure.
+            # This is NOT how you'd do it in a real scenario for an LLM.
+            dummy_token_ids = tf.constant([[10, 20, 30, 40, 50]], dtype=tf.int32) # Placeholder IDs
+
+            # Check if model has been built (important if layers are created dynamically)
+            if not model.built:
+                 try:
+                    model.build(input_shape=dummy_token_ids.shape) # Attempt to build
+                    logger.info("LLM model built successfully before call.")
+                 except Exception as build_e:
+                    logger.error(f"Failed to build LLM model: {build_e}", exc_info=True)
+                    model = None # Mark as unusable if build fails
+
+            if model and model.built: # Re-check after build attempt
+                logger.info(f"Running LLM inference with dummy input shape: {dummy_token_ids.shape}")
+                # Ensure the task 'text_generation' or 'classification' matches a defined head in your model
+                # And that the output of that head is appropriate.
+                llm_output = model(dummy_token_ids, task='text_generation', training=False) # Or 'classification'
+                
+                if llm_output is not None:
+                    # The output processing depends on what your task_head['text_generation'] produces.
+                    # If it's logits for vocabulary, you might take argmax or sample.
+                    # For demonstration, just converting to a list.
+                    try:
+                        processed_output = llm_output.numpy().tolist()
+                        llm_result_str = f"LLM Output (raw): {processed_output}"
+                        logger.info(f"LLM Inference successful: {llm_result_str}")
+                    except Exception as e_proc:
+                        llm_result_str = f"LLM output processing error: {e_proc}"
+                        logger.error(llm_result_str, exc_info=True)
+                else:
+                    llm_result_str = "LLM model call returned None."
+                    logger.warning(llm_result_str)
+            else:
+                 llm_result_str = "LLM model is not built or became None after build attempt."
+                 logger.warning(llm_result_str)
+
+        except Exception as e_llm:
+            llm_result_str = f"LLM Inference Error: {e_llm}"
+            logger.error(llm_result_str, exc_info=True)
+    else:
+        logger.warning("LLM model was not initialized, skipping inference.")
+        
+    scan_results["LLM Inference (Example)"] = llm_result_str
+
+    logger.info(f"Comprehensive analysis finished for {url}. Results: {json.dumps(scan_results, indent=2, default=str)}") # Use default=str for non-serializable
+    return scan_results
+
+
+# Function to generate advanced reports (HTML report with detailed results)
+def generate_report_html(scan_results: Dict[str, Any], report_filename: str = "security_scan_report.html") -> str:
+    """
+    Generates an HTML report with a detailed security analysis.
+    Returns a message indicating success or failure.
+    """
+    logger.info(f"Generating HTML report: {report_filename}")
+    
+    # Helper to safely format JSON for pre tags, escaping HTML
+    def format_json_for_html(data) -> str:
+        import html
+        try:
+            if isinstance(data, (dict, list)):
+                return html.escape(json.dumps(data, indent=4, default=str))
+            return html.escape(str(data)) # Fallback for non-JSON serializable or simple strings
+        except Exception as e:
+            logger.error(f"Error formatting data for HTML report: {e}")
+            return html.escape(f"Error formatting data: {e}")
+
+    html_report = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Security Scan Report</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }}
+            .container {{ background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
+            h1 {{ color: #333; border-bottom: 2px solid #4CAF50; padding-bottom: 10px; }}
+            h2 {{ color: #4CAF50; margin-top: 30px; }}
+            h3 {{ color: #555; }}
+            pre {{ background-color: #eee; padding: 15px; border-radius: 5px; overflow-x: auto; white-space: pre-wrap; word-wrap: break-word; }}
+            p, li {{ line-height: 1.6; }}
+            .timestamp {{ font-size: 0.9em; color: #777; margin-bottom: 20px;}}
+            .section {{ margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px; }}
+            .section-title {{ font-weight: bold; font-size: 1.1em; margin-bottom: 10px; }}
+            .vulnerability {{ color: red; font-weight: bold; }}
+            .no-vulnerability {{ color: green; }}
+            .error {{ color: orange; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Security Scan Report</h1>
+            <p class="timestamp">Scan completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+
+            <div class="section">
+                <h2 id="portscan">Port Scan Results</h2>
+                <pre>{format_json_for_html(scan_results.get('Port Scan', 'Not available'))}</pre>
+            </div>
+
+            <div class="section">
+                <h2 id="xss">XSS Detection</h2>
+                <p class="{ 'vulnerability' if 'Vulnerability Detected' in str(scan_results.get('XSS Detection')) else ('error' if 'Error' in str(scan_results.get('XSS Detection')) else 'no-vulnerability') }">
+                    {format_json_for_html(scan_results.get('XSS Detection', 'Not available'))}
+                </p>
+            </div>
+            
+            <div class="section">
+                <h2 id="idor">IDOR Detection</h2>
+                <p class="{ 'vulnerability' if 'Vulnerability Detected' in str(scan_results.get('IDOR Detection')) else ('error' if 'Error' in str(scan_results.get('IDOR Detection')) else 'no-vulnerability') }">
+                    {format_json_for_html(scan_results.get('IDOR Detection', 'Not available'))}
+                </p>
+            </div>
+
+            <div class="section">
+                <h2 id="sqli">SQL Injection Detection</h2>
+                <p class="{ 'vulnerability' if 'Vulnerability Detected' in str(scan_results.get('SQL Injection Detection')) else ('error' if 'Error' in str(scan_results.get('SQL Injection Detection')) else 'no-vulnerability') }">
+                    {format_json_for_html(scan_results.get('SQL Injection Detection', 'Not available'))}
+                </p>
+            </div>
+
+            <div class="section">
+                <h2 id="cmdi">Command Injection Detection</h2>
+                <p class="{ 'vulnerability' if 'Vulnerability Detected' in str(scan_results.get('Command Injection Detection')) else ('error' if 'Error' in str(scan_results.get('Command Injection Detection')) else 'no-vulnerability') }">
+                    {format_json_for_html(scan_results.get('Command Injection Detection', 'Not available'))}
+                </p>
+            </div>
+            
+            <div class="section">
+                <h2 id="nikto">Nikto Scan</h2>
+                <pre>{format_json_for_html(scan_results.get('Nikto Scan', 'Not available'))}</pre>
+            </div>
+
+            <div class="section">
+                <h2 id="spider">Web Crawler Results</h2>
+                <pre>{format_json_for_html(scan_results.get('Web Crawler', 'Not available'))}</pre>
+            </div>
+            
+            <div class="section">
+                <h2 id="patches">Patch Suggestions (from LLM)</h2>
+                <pre>{format_json_for_html(scan_results.get('Patch Suggestions', {}).get('LLM Suggestions', 'Not available'))}</pre>
+            </div>
+
+            <div class="section">
+                <h2 id="llm_inference">LLM Inference (Example)</h2>
+                <pre>{format_json_for_html(scan_results.get('LLM Inference (Example)', 'Not available'))}</pre>
+            </div>
+
+        </div>
+    </body>
+    </html>
+    """
+    try:
+        # Ensure the directory for reports exists
+        report_dir = os.path.dirname(report_filename)
+        if report_dir and not os.path.exists(report_dir):
+            os.makedirs(report_dir)
+            
+        with open(report_filename, "w", encoding="utf-8") as report_file:
+            report_file.write(html_report)
+        logger.info(f"HTML report generated and saved to: {report_filename}")
+        return f"HTML Report generated: {report_filename}"
+    except Exception as e:
+        logger.error(f"Error generating HTML report {report_filename}: {e}", exc_info=True)
+        return f"Error generating HTML report: {e}"
+
+
+# Authentication Function (using API key from config.yaml)
+def authenticate_user(provided_api_key: str) -> Tuple[bool, str]:
+    """
+    Authenticates the user by checking their API key against 'app_api_key' in config.yaml.
+    """
+    if not provided_api_key:
+        return False, "API Key cannot be empty."
+
+    # Get the 'app_api_key' which is used to authenticate users TO THIS APP
+    # This is different from 'api_keys' for external services like Groq, Mistral, ElevenLabs
+    app_api_key_file = config.get('api_key_file', 'config.yaml')
+    try:
+        with open(app_api_key_file, 'r') as f:
+            yaml_config_data = yaml.safe_load(f)
+        
+        if not isinstance(yaml_config_data, dict):
+            logger.error(f"Content of {app_api_key_file} is not a dictionary (for app_api_key).")
+            return False, "Authentication configuration error."
+
+        # The key used to secure the app itself
+        valid_app_api_key = yaml_config_data.get('app_api_key') 
+        
+        if valid_app_api_key is None:
+            logger.error(f"'app_api_key' not found in {app_api_key_file}. Cannot authenticate users.")
+            return False, "Error: App authentication key not configured on server."
+        
+        # Securely compare keys (e.g., using hmac.compare_digest if they were hashed)
+        # For direct comparison of plain text keys (less secure, but as per original):
+        if provided_api_key == str(valid_app_api_key):
+            logger.info("User authentication successful.")
+            return True, "Authentication successful!"
+        else:
+            logger.warning(f"Failed authentication attempt with key: {provided_api_key[:5]}...") # Log partial key
+            return False, "Invalid API key. Please provide a valid API key for this application."
+            
+    except FileNotFoundError:
+        logger.error(f"App API key file not found: {app_api_key_file}")
+        return False, f"Error: App authentication configuration file not found."
+    except yaml.YAMLError as e:
+        logger.error(f"Error reading app API key file {app_api_key_file}: {e}", exc_info=True)
+        return False, f"Error reading app authentication configuration: {e}"
+    except Exception as e:
+        logger.error(f"Error during app authentication: {e}", exc_info=True)
+        return False, f"An unexpected error occurred during authentication: {e}"
+
+
+# --- Global variable to track authentication status ---
+# This is a simple way to manage state for a single-user Gradio app.
+# For multi-user or more robust scenarios, use proper session management.
+USER_IS_AUTHENTICATED = False
+
+# Gradio Interface
+def ai_driven_browser_gradio(url: str, task_description_from_chat: Optional[List[List[str]]], # Chatbot input is List[List[str]]
+                             advanced_scan_cb: bool, custom_ports_txt: Optional[str],
+                             # api_key_txt is now handled by auth_button
+                             chat_history_state: Optional[List[List[str]]]) -> Dict[str, Any]:
+    """
+    Main function for the AI-driven web browser with security analysis and chat, called by Gradio.
+    """
+    global USER_IS_AUTHENTICATED
+    if not USER_IS_AUTHENTICATED:
+        # This message will appear in the JSON output if auth fails before analysis
+        # The button click handler for "Run Analysis" should also check this.
+        
+        # Preserve chat history even on auth failure
+        auth_fail_chat_history = chat_history_state if chat_history_state is not None else []
+        auth_fail_chat_history.append([None, "Authentication failed. Please authenticate with a valid App API Key first."])
+
+        return {
+            "Analysis Results": {"error": "User not authenticated. Please authenticate first."},
+            "Screenshot": None, # No image path
+            "Report HTML File": "Authentication Failed. No report generated.",
+            "Chat History": auth_fail_chat_history, 
+            "Audio Output": None # No audio path
+        }
+
+    # Initialize or preserve chat history
+    current_chat_history = chat_history_state if chat_history_state is not None else []
+    
+    # Extract the latest user message from task_description_from_chat
+    user_query = ""
+    if task_description_from_chat and isinstance(task_description_from_chat, list) and task_description_from_chat:
+        # Gradio chatbot input is a list of lists, e.g., [["user msg1", "bot_resp1"], ["user_msg2", None]]
+        # We are interested in the last user message that hasn't been "responded" to by the bot logic yet.
+        # This logic assumes 'None' as the bot part means it's a fresh user query for this run.
+        if task_description_from_chat[-1] and len(task_description_from_chat[-1]) == 2 and task_description_from_chat[-1][1] is None:
+            user_query = task_description_from_chat[-1][0]
+
+    if not url or not url.strip():
+        ai_response = "Please provide a URL to analyze."
+        # Add to chat history. If user_query was part of the input that led here, include it.
+        # Otherwise, it's a direct call without new chat input.
+        current_chat_history.append([user_query if user_query else None, ai_response])
+        
+        return {
+            "Analysis Results": {"status": "Awaiting URL."},
+            "Screenshot": None,
+            "Report HTML File": "No analysis run yet. Please provide a URL.",
+            "Chat History": current_chat_history,
+            "Audio Output": None
+        }
+
+    # Acknowledge the user's request in chat
+    # This ensures the user's last message gets a bot response in the chat history
+    ai_ack_response = f"Understood. Analyzing URL: {url}."
+    if user_query: # If there was a fresh user query for this run
+        ai_ack_response += f" Your request: '{user_query}'"
+    
+    # Update the last user message's bot response part, or add a new entry if no fresh user query
+    if current_chat_history and current_chat_history[-1][0] == user_query and current_chat_history[-1][1] is None:
+        current_chat_history[-1][1] = ai_ack_response
+    else: # If user_query was empty or chat history doesn't match, append new system message
+        current_chat_history.append([None, ai_ack_response])
+
+
+    # Perform the analysis
+    # Ensure custom_ports_txt is None if empty, not just whitespace
+    effective_custom_ports = custom_ports_txt.strip() if custom_ports_txt else None
+    
+    # Add a "processing" message to chat
+    current_chat_history.append([None, "Performing security analysis... This may take a few minutes."])
+    # We yield this intermediate chat state if Gradio supports streaming/updates during a long fn call.
+    # For a simple return, this will be part of the final chat history.
+
+    from urllib.parse import urlparse # Moved import here
+    analysis_results = analyze_and_patch(url, advanced_nmap_scan=advanced_scan_cb, custom_nmap_ports=effective_custom_ports)
+
+    # Generate HTML report and get the filename
+    # Sanitize URL for filename
+    parsed_url_for_filename = urlparse(url)
+    safe_netloc = "".join(c if c.isalnum() else "_" for c in parsed_url_for_filename.netloc)
+    report_filename = f"security_report_{safe_netloc}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+    report_status_msg = generate_report_html(analysis_results, report_filename=report_filename)
+
+    # Take screenshot and get the filename
+    screenshot_filename = f"screenshot_{safe_netloc}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+    screenshot_path = take_screenshot(url, output_filename=screenshot_filename)
+
+
+    # --- Generate Speech from a summary of results ---
+    speech_summary = f"Security analysis for {urlparse(url).netloc} is complete. " # Use netloc for brevity
+    vuln_count = 0
+    if isinstance(analysis_results.get("XSS Detection"), str) and "Vulnerability Detected" in analysis_results.get("XSS Detection", ""):
+        speech_summary += "Cross-Site Scripting vulnerability found. "
+        vuln_count +=1
+    if isinstance(analysis_results.get("SQL Injection Detection"), str) and "Vulnerability Detected" in analysis_results.get("SQL Injection Detection", ""):
+        speech_summary += "SQL Injection vulnerability found. "
+        vuln_count +=1
+    if isinstance(analysis_results.get("Command Injection Detection"), str) and "Vulnerability Detected" in analysis_results.get("Command Injection Detection", ""):
+        speech_summary += "Command Injection vulnerability found. "
+        vuln_count +=1
+    
+    if vuln_count == 0:
+        speech_summary += "No critical vulnerabilities like XSS, SQL Injection, or Command Injection were found by the automated tests. "
+    else:
+        speech_summary += f"{vuln_count} critical vulnerability type(s) identified. "
+    speech_summary += f"A detailed HTML report named '{os.path.basename(report_filename)}' and a screenshot have been generated. Check the output tabs for details."
+    
+    # Add a concluding remark to chat
+    current_chat_history.append([None, speech_summary])
+
+    audio_output_path = None
+    if get_api_key('elevenlabs'): # Only try if key is likely configured
+        audio_output_filename = f"speech_summary_{safe_netloc}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp3"
+        audio_output_path = generate_speech_elevenlabs(speech_summary, output_filename=audio_output_filename)
+        if audio_output_path:
+            logger.info(f"Speech summary generated: {audio_output_path}")
+        else:
+            logger.warning("Failed to generate speech summary audio.")
+            current_chat_history.append([None, "(Speech generation failed or was skipped due to an error with ElevenLabs.)"])
+    else:
+        logger.info("Skipping speech generation as ElevenLabs API key is not configured/set.")
+        current_chat_history.append([None, "(Speech generation skipped - ElevenLabs API key missing or not set up.)"])
+
+
+    # Prepare outputs for Gradio interface
+    # Gradio expects file paths for Image and Audio components to serve them.
+    return {
+        "Analysis Results": analysis_results,
+        "Screenshot": screenshot_path, # Path to the image file
+        "Report HTML File": report_status_msg, # Message about the report file
+        "Chat History": current_chat_history,
+        "Audio Output": audio_output_path # Path to the audio file
+    }
+
+
+def auth_button_click(api_key_input: str, current_chat_history: Optional[List[List[str]]]) -> Tuple[str, List[List[str]]]:
+    """
+    Handles the API key authentication when the button is clicked.
+    Updates global authentication status.
+    Returns (auth_status_message_for_label, updated_chat_history)
+    """
+    global USER_IS_AUTHENTICATED
+    is_authenticated, message = authenticate_user(api_key_input)
+    USER_IS_AUTHENTICATED = is_authenticated
+    
+    auth_label_message = f"Authentication Status: {message}"
+    
+    # Update chat history with authentication status
+    chat_history = current_chat_history if current_chat_history is not None else []
+    chat_history.append([None, f"System: {message}"]) # Add auth message as a system message to chat
+    
+    logger.info(f"Auth attempt: {message}, Success: {is_authenticated}")
+    return auth_label_message, chat_history
+
+
+# Create the Gradio interface
+def create_interface():
+    with gr.Blocks(theme=gr.themes.Soft(), title="AI Security Browser") as interface:
+        gr.Markdown("## AI-Driven Web Browser with Security Analysis")
+        
+        # --- Authentication Row ---
+        with gr.Row():
+            api_key_input = gr.Textbox(
+                label="App API Key", 
+                placeholder="Enter your application API key here", 
+                type="password",
+                scale=3
+            )
+            auth_button = gr.Button("Authenticate App", scale=1)
+        auth_output_label = gr.Label(value="Authentication Status: Not Authenticated") # For displaying auth status
+
+        gr.Markdown("---") # Separator
+
+        with gr.Row():
+            with gr.Column(scale=2): # Inputs Column
+                url_input = gr.Textbox(label="Target URL", placeholder="e.g., http://example.com")
+                
+                with gr.Accordion("Scan Options", open=False):
+                    advanced_scan_checkbox = gr.Checkbox(label="Enable Advanced Nmap Scan (OS, Service, Scripts)")
+                    custom_ports_input = gr.Textbox(label="Custom Nmap Ports (optional)", placeholder="e.g., 80,443,8000-8010")
+                
+                run_analysis_button = gr.Button("Run Full Analysis & Get Report", variant="primary")
+
+            with gr.Column(scale=3): # Chat Column
+                chat_interface = gr.Chatbot(
+                    label="Conversation Log & Task Input",
+                    bubble_full_width=False,
+                    placeholder="Authentication status and analysis progress will appear here. You can also type security-related questions or tasks for the AI after entering a URL.",
+                    height=400 
+                )
+                user_chat_input = gr.Textbox(label="Your Message", placeholder="Type here and press Enter to chat or provide a task context...")
+
+        gr.Markdown("---") # Separator
+        
+        # --- Outputs ---
+        with gr.Tabs():
+            with gr.TabItem("Analysis Summary & Report"):
+                output_json = gr.Json(label="Full Analysis Results (JSON)")
+                output_report_status = gr.Markdown(label="HTML Report Status & Link") 
+            with gr.TabItem("Screenshot & Audio"):
+                output_image = gr.Image(label="Website Screenshot", type="filepath", interactive=False)
+                output_audio = gr.Audio(label="Analysis Speech Summary", type="filepath", interactive=False)
+        
+        # --- Event Handlers ---
+
+        auth_button.click(
+            fn=auth_button_click,
+            inputs=[api_key_input, chat_interface], # Pass current chat history
+            outputs=[auth_output_label, chat_interface] # Update label and chat history
+        )
+
+        def handle_chat_submit(user_message: str, chat_history_list: Optional[List[List[str]]]):
+            # This function appends the user message to the history for the main analysis function to see.
+            # It doesn't generate an immediate bot response here; that's done by ai_driven_browser_gradio.
+            history = chat_history_list if chat_history_list is not None else []
+            if user_message and user_message.strip():
+                history.append([user_message, None]) # Add user message, bot response part is None initially
+            return history, "" # Return updated history and clear the input textbox
+
+        user_chat_input.submit(
+            fn=handle_chat_submit,
+            inputs=[user_chat_input, chat_interface],
+            outputs=[chat_interface, user_chat_input] 
+        )
+
+        run_analysis_button.click(
+            fn=ai_driven_browser_gradio,
+            inputs=[
+                url_input, 
+                chat_interface, 
+                advanced_scan_checkbox, 
+                custom_ports_input,
+                chat_interface # Pass chat_interface again as chat_history_state (it holds the latest state)
+            ],
+            outputs=[
+                output_json, 
+                output_image, 
+                output_report_status, 
+                chat_interface, 
+                output_audio
+            ]
+        ).then(
+            fn=lambda: "Analysis complete. Check results.", # Simple notification
+            inputs=None,
+            outputs=None # Could be a status gr.Markdown if needed
+        )
+        
+        gr.Markdown("---")
+        gr.Markdown("### Notes:\n"
+                    "- **API Keys**: Ensure `config.yaml` is present in the same directory and contains `app_api_key` for this tool, and `api_keys` dictionary for `groq`, `mistral`, and `elevenlabs`.\n"
+                    "  Example `config.yaml`:\n"
+                    "  ```yaml\n"
+                    "  app_api_key: 'YOUR_SECRET_APP_KEY_FOR_THIS_TOOL'\n"
+                    "  api_keys:\n"
+                    "    groq: 'YOUR_GROQ_API_KEY'\n"
+                    "    mistral: 'YOUR_MISTRAL_API_KEY'\n"
+                    "    elevenlabs: 'YOUR_ELEVENLABS_API_KEY'\n"
+                    "  # ... other model config if needed by the MultiModalTransformer ...\n"
+                    "  ```\n"
+                    "- **External Tools**: `nmap` and `nikto` must be installed and in your system's PATH.\n"
+                    "- **Output Files**: Screenshots, HTML reports, and audio files will be saved in the script's directory (or subdirectories if specified).\n"
+                    "- **LLM Model**: The integrated `MultiModalTransformer` is a complex component. Its functionality for 'LLM Inference (Example)' is a placeholder and depends on its specific training and architecture. Ensure it's correctly configured if you intend to use its direct inference capabilities beyond the LLM API calls (Groq/Mistral).")
+
+    return interface
+
+if __name__ == "__main__":
+    # Create a dummy config.yaml if it doesn't exist for easier first run
+    # In a real deployment, this should be managed securely.
+    if not os.path.exists("config.yaml"):
+        logger.warning("config.yaml not found. Creating a dummy config.yaml. Please edit it with your actual API keys.")
+        dummy_config_content = """
+# This is a dummy config.yaml. PLEASE REPLACE with your actual API keys.
+app_api_key: 'replace_with_your_secret_app_key' # Key to access THIS Gradio tool
+
+api_keys:
+  groq: 'YOUR_GROQ_API_KEY_HERE'
+  mistral: 'YOUR_MISTRAL_API_KEY_HERE'
+  elevenlabs: 'YOUR_ELEVENLABS_API_KEY_HERE'
+  # Add other external service API keys here if needed
+
+# Example model configuration parameters (if your MultiModalTransformer needs them from file)
+# These are also present as defaults in the script's `config_yaml` string.
+# n_vocab: 50000
+# n_ctx: 512
+# n_embd: 256
+# ... etc.
+"""
+        try:
+            with open("config.yaml", "w") as f_dummy:
+                f_dummy.write(dummy_config_content)
+            logger.info("Dummy config.yaml created. Please update it with your API keys.")
+        except IOError as e_io:
+            logger.error(f"Could not create dummy config.yaml: {e_io}")
+
+    # Attempt to load ElevenLabs API key from config at startup
+    try:
+        elevenlabs_startup_key = get_api_key('elevenlabs')
+        if elevenlabs_startup_key:
+            elevenlabs.set_api_key(elevenlabs_startup_key) # Use elevenlabs.set_api_key
+            logger.info("ElevenLabs API key successfully loaded and set at startup.")
+        else:
+            logger.warning("ElevenLabs API key not found in config.yaml at startup. Speech generation will require a valid key.")
+    except Exception as e_startup_key:
+        logger.error(f"Error setting ElevenLabs API key at startup: {e_startup_key}")
+
+
+    gradio_app_interface = create_interface()
+    try:
+        gradio_app_interface.launch(share=False) # Set share=True to create a public link (use with caution)
+        logger.info("Gradio interface launched.")
+    except Exception as e_launch:
+        logger.critical(f"Failed to launch Gradio interface: {e_launch}", exc_info=True)
