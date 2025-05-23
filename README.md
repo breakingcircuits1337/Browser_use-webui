@@ -165,6 +165,19 @@ docker compose down
 - **Enhanced LLM Integration**: Expanding support for additional LLMs and improving existing integrations.
 - **Improved Error Handling**: Making the system more robust and user-friendly.
 
+## Potential Feature: AI-Driven Vulnerability Testing
+
+A potential future enhancement for BC's Browser is the integration of an AI-driven vulnerability testing function. This feature would leverage the AI's ability to interact with web pages to automatically identify potential security weaknesses.
+
+**Benefits:**
+
+- **Automated Testing**: Reduces the manual effort required for basic vulnerability scanning.
+- **Improved Efficiency**: Allows for faster identification of common vulnerabilities across multiple web pages.
+
+**Challenges:**
+
+- **Accuracy**: Ensuring the AI accurately identifies and reports genuine vulnerabilities without generating false positives.
+- **Scope**: Defining the range of vulnerabilities the AI can effectively detect.
 ---
 
 ## Contributing
