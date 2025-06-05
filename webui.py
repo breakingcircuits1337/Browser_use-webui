@@ -129,7 +129,7 @@ def latency_monitor_skill_webui(target_ip, interval, duration):
 
 def route_table_skill_webui():
     routes = route_table_tool.get_routes()
-    output = [] 
+    output = []
     if routes and isinstance(routes[0], dict) and 'error' in routes[0]:
         return routes[0]['error']
     if not routes or (isinstance(routes[0], dict) and routes[0].get('status')):
@@ -140,22 +140,22 @@ def route_table_skill_webui():
         output.append(f"  Netmask:   {route.get('netmask', 'N/A')}")
         output.append(f"  Gateway:   {route.get('gateway', 'N/A')}")
         output.append(f"  Interface: {route.get('interface', 'N/A')}")
-        output.append("-" * 20) 
+        output.append("-" * 20)
     return "\n".join(output)
 
 
 async def stop_agent():
     """Request the agent to stop and update UI with enhanced feedback"""
-    global _global_agent_state 
+    global _global_agent_state
 
     try:
         _global_agent_state.request_stop()
         message = "Stop requested - the agent will halt at the next safe point"
         logger.info(f"🛑 {message}")
         return (
-            message,                                       
-            gr.update(value="Stopping...", interactive=False), 
-            gr.update(interactive=False),                     
+            message,
+            gr.update(value="Stopping...", interactive=False),
+            gr.update(interactive=False),
         )
     except Exception as e:
         error_msg = f"Error during stop: {str(e)}"
@@ -165,25 +165,25 @@ async def stop_agent():
             gr.update(value="Stop", interactive=True),
             gr.update(interactive=True)
         )
-        
+
 async def stop_research_agent():
     """Request the agent to stop and update UI with enhanced feedback for research agent"""
-    global _global_agent_state 
+    global _global_agent_state
 
     try:
         _global_agent_state.request_stop()
         message = "Stop requested - the research agent will halt at the next safe point"
-        logger.info(f"🛑 {message}") 
+        logger.info(f"🛑 {message}")
         return (
-            gr.update(value="Stopping...", interactive=False), 
-            gr.update(interactive=False),                     
+            gr.update(value="Stopping...", interactive=False),
+            gr.update(interactive=False),
         )
     except Exception as e:
         error_msg = f"Error during research stop: {str(e)}"
         logger.error(error_msg)
         return (
-            gr.update(value="Stop", interactive=True), 
-            gr.update(interactive=True)               
+            gr.update(value="Stop", interactive=True),
+            gr.update(interactive=True)
         )
 
 async def run_browser_agent(
@@ -215,7 +215,7 @@ async def run_browser_agent(
         # <<< END MODIFICATION >>>
 ):
     global _global_agent_state
-    _global_agent_state.clear_stop() 
+    _global_agent_state.clear_stop()
 
     try:
         if not enable_recording and agent_type != "pen_test": # Pen test might not need recording by default
@@ -223,9 +223,9 @@ async def run_browser_agent(
 
         if save_recording_path:
             os.makedirs(save_recording_path, exist_ok=True)
-        if save_agent_history_path: 
+        if save_agent_history_path:
             os.makedirs(save_agent_history_path, exist_ok=True)
-        if save_trace_path: 
+        if save_trace_path:
             os.makedirs(save_trace_path, exist_ok=True)
 
         existing_videos = set()
@@ -316,30 +316,30 @@ async def run_browser_agent(
             model_actions,
             model_thoughts,
             latest_video,
-            trace_file, 
-            history_file, 
-            gr.update(value="Stop", interactive=True), 
-            gr.update(interactive=True)   
+            trace_file,
+            history_file,
+            gr.update(value="Stop", interactive=True),
+            gr.update(interactive=True)
         )
 
-    except gr.Error: 
+    except gr.Error:
         logger.error("A Gradio UI update error occurred.")
-        raise 
+        raise
 
     except Exception as e:
         import traceback
         logger.error(f"Exception in run_browser_agent: {e}\n{traceback.format_exc()}")
         errors_msg = str(e) + "\n" + traceback.format_exc()
         return (
-            '',                                         
-            errors_msg,                                 
-            '',                                         
-            '',                                         
-            None,                                       
-            None,                                       
-            None,                                       
-            gr.update(value="Stop", interactive=True), 
-            gr.update(interactive=True)   
+            '',
+            errors_msg,
+            '',
+            '',
+            None,
+            None,
+            None,
+            gr.update(value="Stop", interactive=True),
+            gr.update(interactive=True)
         )
 
 
@@ -361,21 +361,21 @@ async def run_org_agent(
         tool_calling_method
 ):
     global _global_browser, _global_browser_context, _global_agent_state
-    trace_file_path = None 
-    history_file_path = None 
+    trace_file_path = None
+    history_file_path = None
     try:
         _global_agent_state.clear_stop()
 
         extra_chromium_args = [f"--window-size={int(window_w)},{int(window_h)}"]
         if use_own_browser:
-            chrome_path = os.getenv("CHROME_PATH") 
-            if chrome_path == "": chrome_path = None 
+            chrome_path = os.getenv("CHROME_PATH")
+            if chrome_path == "": chrome_path = None
             chrome_user_data = os.getenv("CHROME_USER_DATA")
             if chrome_user_data:
                 extra_chromium_args.append(f"--user-data-dir={chrome_user_data}")
         else:
             chrome_path = None
-            
+
         if _global_browser is None:
             _global_browser = Browser(
                 config=BrowserConfig(
@@ -388,16 +388,16 @@ async def run_org_agent(
 
         if _global_browser_context is None:
             _global_browser_context = await _global_browser.new_context(
-                config=OrgBrowserContextConfig( 
+                config=OrgBrowserContextConfig(
                     trace_path=save_trace_path if save_trace_path else None,
                     save_recording_path=save_recording_path if save_recording_path else None,
-                    no_viewport=False, 
+                    no_viewport=False,
                     browser_window_size=BrowserContextWindowSize(
                         width=int(window_w), height=int(window_h)
                     ),
                 )
             )
-            
+
         agent = Agent(
             task=task,
             llm=llm,
@@ -406,7 +406,7 @@ async def run_org_agent(
             browser_context=_global_browser_context,
             max_actions_per_step=max_actions_per_step,
             tool_calling_method=tool_calling_method,
-            agent_state=_global_agent_state 
+            agent_state=_global_agent_state
         )
         history = await agent.run(max_steps=max_steps)
 
@@ -428,7 +428,7 @@ async def run_org_agent(
         import traceback
         logger.error(f"Exception in run_org_agent: {e}\n{traceback.format_exc()}")
         errors_msg = str(e) + "\n" + traceback.format_exc()
-        return '', errors_msg, '', '', None, None 
+        return '', errors_msg, '', '', None, None
     finally:
         if not keep_browser_open:
             if _global_browser_context:
@@ -457,8 +457,8 @@ async def run_custom_agent(
         tool_calling_method
 ):
     global _global_browser, _global_browser_context, _global_agent_state
-    trace_file_path = None 
-    history_file_path = None 
+    trace_file_path = None
+    history_file_path = None
     try:
         _global_agent_state.clear_stop()
 
@@ -475,8 +475,8 @@ async def run_custom_agent(
         controller = CustomController()
 
         if _global_browser is None:
-            _global_browser = CustomBrowser( 
-                config=BrowserConfig( 
+            _global_browser = CustomBrowser(
+                config=BrowserConfig(
                     headless=headless,
                     disable_security=disable_security,
                     chrome_instance_path=chrome_path,
@@ -485,16 +485,16 @@ async def run_custom_agent(
             )
         if _global_browser_context is None:
             _global_browser_context = await _global_browser.new_context(
-                config=CustomBrowserContextConfigInternal( 
+                config=CustomBrowserContextConfigInternal(
                     trace_path=save_trace_path if save_trace_path else None,
                     save_recording_path=save_recording_path if save_recording_path else None,
                     no_viewport=False,
-                    browser_window_size=BrowserContextWindowSize( 
+                    browser_window_size=BrowserContextWindowSize(
                         width=int(window_w), height=int(window_h)
                     ),
                 )
             )
-            
+
         agent = CustomAgent(
             task=task,
             add_infos=add_infos,
@@ -522,14 +522,14 @@ async def run_custom_agent(
         model_thoughts = history.model_thoughts()
 
         trace_files_dict = get_latest_files(save_trace_path)
-        trace_file_path = trace_files_dict.get('.zip') if trace_files_dict else None    
+        trace_file_path = trace_files_dict.get('.zip') if trace_files_dict else None
 
         return final_result, errors, model_actions, model_thoughts, trace_file_path, history_file_path
     except Exception as e:
         import traceback
         logger.error(f"Exception in run_custom_agent: {e}\n{traceback.format_exc()}")
         errors_msg = str(e) + "\n" + traceback.format_exc()
-        return '', errors_msg, '', '', None, None 
+        return '', errors_msg, '', '', None, None
     finally:
         if not keep_browser_open:
             if _global_browser_context:
@@ -555,7 +555,7 @@ async def execute_web_pen_test(
     # This pen_test agent will run headlessly by default for analysis
     # It will manage its own browser instance or reuse global if keep_browser_open is True
     # and an existing compatible one is available.
-    
+
     current_browser = None
     current_context = None
     is_new_browser_instance = False
@@ -611,15 +611,15 @@ async def execute_web_pen_test(
             "1. Attempt to navigate to common sensitive paths such as `/.git/config`, `/.env`, `/config.json`, `/wp-admin/` (if WordPress suspected), `/admin/`.\n"
             "2. Report if any of these paths return a 200 OK status or reveal sensitive information. Do not attempt to download large files or recursively explore directories found."
         )
-    
+
     prompt_parts.append("\nCompile a consolidated report of your findings for all selected tests.")
     llm_task_description = "".join(prompt_parts)
 
     try:
         extra_chromium_args = [f"--window-size={int(window_w)},{int(window_h)}"]
         if use_own_browser:
-            chrome_path = os.getenv("CHROME_PATH") 
-            if chrome_path == "": chrome_path = None 
+            chrome_path = os.getenv("CHROME_PATH")
+            if chrome_path == "": chrome_path = None
             chrome_user_data = os.getenv("CHROME_USER_DATA")
             if chrome_user_data:
                 extra_chromium_args.append(f"--user-data-dir={chrome_user_data}")
@@ -645,7 +645,7 @@ async def execute_web_pen_test(
             is_new_browser_instance = True
             current_context = await current_browser.new_context(
                  config=OrgBrowserContextConfig( # Using Org config for simplicity
-                    no_viewport=False, 
+                    no_viewport=False,
                     browser_window_size=BrowserContextWindowSize(
                         width=int(window_w), height=int(window_h)
                     ),
@@ -665,9 +665,9 @@ async def execute_web_pen_test(
             browser_context=current_context,
             max_actions_per_step=5, # Allow a few actions per step for analysis
             tool_calling_method="auto", # Or as configured
-            agent_state=agent_state 
+            agent_state=agent_state
         )
-        
+
         # The agent will execute the steps described in the prompt.
         # This might involve multiple interactions with the browser.
         # Max_steps might need to be adjusted based on complexity.
@@ -731,8 +731,8 @@ async def run_with_stream(
     # <<< END MODIFICATION >>>
 ):
     global _global_agent_state, _global_browser_context
-    stream_vw = 80 
-    stream_vh = int(stream_vw * int(window_h) // int(window_w)) if int(window_w) > 0 else int(stream_vw * 9/16) 
+    stream_vw = 80
+    stream_vh = int(stream_vw * int(window_h) // int(window_w)) if int(window_w) > 0 else int(stream_vw * 9/16)
 
     # <<< BEGIN MODIFICATION: Handle pen_test type in run_with_stream >>>
     if agent_type == "pen_test":
@@ -791,7 +791,7 @@ async def run_with_stream(
             llm_api_key=llm_api_key,
             use_own_browser=use_own_browser,
             keep_browser_open=keep_browser_open,
-            headless=headless, 
+            headless=headless,
             disable_security=disable_security,
             window_w=window_w,
             window_h=window_h,
@@ -822,7 +822,7 @@ async def run_with_stream(
                     llm_api_key=llm_api_key,
                     use_own_browser=use_own_browser,
                     keep_browser_open=keep_browser_open,
-                    headless=headless, 
+                    headless=headless,
                     disable_security=disable_security,
                     window_w=window_w,
                     window_h=window_h,
@@ -850,35 +850,35 @@ async def run_with_stream(
                     logger.info("Stop requested, breaking stream loop.")
                     html_content = f"<div style='width:{stream_vw}vw; height:{stream_vh}vh; display:flex; align-items:center; justify-content:center; border:1px solid #ccc;'><h1>Agent stopping...</h1></div>"
                     stop_button_update = gr.update(value="Stopping...", interactive=False)
-                    run_button_update = gr.update(interactive=False) 
+                    run_button_update = gr.update(interactive=False)
                     yield [html_content, final_result, errors_output_val, model_actions_val, model_thoughts_val, latest_video_val, trace_file_val, history_file_val, stop_button_update, run_button_update]
-                    break 
+                    break
 
                 try:
-                    if _global_browser_context and headless: 
+                    if _global_browser_context and headless:
                         encoded_screenshot = await capture_screenshot(_global_browser_context)
                         if encoded_screenshot:
                             html_content = f'<img src="data:image/jpeg;base64,{encoded_screenshot}" style="width:{stream_vw}vw; height:{stream_vh}vh; object-fit:contain; border:1px solid #ccc;">'
-                        else: 
-                            if not html_content.startswith("<img"): 
+                        else:
+                            if not html_content.startswith("<img"):
                                 html_content = f"<div style='width:{stream_vw}vw; height:{stream_vh}vh; display:flex; align-items:center; justify-content:center; border:1px solid #ccc;'><h1>Waiting for browser page...</h1></div>"
-                    elif not headless: 
+                    elif not headless:
                          html_content = f"<div style='width:{stream_vw}vw; height:{stream_vh}vh; display:flex; align-items:center; justify-content:center; border:1px solid #ccc;'><h1>Browser running directly (not headless)...</h1></div>"
-                    else: 
+                    else:
                          html_content = f"<div style='width:{stream_vw}vw; height:{stream_vh}vh; display:flex; align-items:center; justify-content:center; border:1px solid #ccc;'><h1>Waiting for browser session...</h1></div>"
 
                 except Exception as e:
                     logger.warning(f"Screenshot capture/display error: {e}")
                     if not html_content.startswith("<img"):
                         html_content = f"<div style='width:{stream_vw}vw; height:{stream_vh}vh; display:flex; align-items:center; justify-content:center; border:1px solid #ccc;'><h1>Error updating view...</h1></div>"
-                
+
                 yield [
                     html_content,
                     final_result, errors_output_val, model_actions_val, model_thoughts_val,
                     latest_video_val, trace_file_val, history_file_val,
                     stop_button_update, run_button_update
                 ]
-                await asyncio.sleep(0.1) 
+                await asyncio.sleep(0.1)
 
             try:
                 (final_result, errors_output_val, model_actions_val, model_thoughts_val,
@@ -900,10 +900,10 @@ async def run_with_stream(
                 logger.info("Agent task was cancelled.")
                 html_content = f"<div style='width:{stream_vw}vw; height:{stream_vh}vh; display:flex; align-items:center; justify-content:center; border:1px solid #ccc;'><h1>Task Cancelled.</h1></div>"
                 errors_output_val = "Task cancelled by user or system."
-                stop_button_update = gr.update(value="Stop", interactive=True) 
-                run_button_update = gr.update(interactive=True) 
+                stop_button_update = gr.update(value="Stop", interactive=True)
+                run_button_update = gr.update(interactive=True)
 
-            except Exception as e: 
+            except Exception as e:
                 import traceback
                 logger.error(f"Error in agent_task or retrieving its result: {e}\n{traceback.format_exc()}")
                 html_content = f"<div style='width:{stream_vw}vw; height:{stream_vh}vh; display:flex; align-items:center; justify-content:center; border:1px solid #ccc;'><h1>Agent Error</h1></div>"
@@ -918,7 +918,7 @@ async def run_with_stream(
                 stop_button_update, run_button_update
             ]
 
-        except Exception as e: 
+        except Exception as e:
             import traceback
             logger.error(f"General error in run_with_stream (headless): {e}\n{traceback.format_exc()}")
             yield [
@@ -955,27 +955,27 @@ async def close_global_browser():
             logger.error(f"Error closing global browser: {e}")
         finally:
             _global_browser = None
-        
+
 async def run_deep_search(
-    research_task, 
-    max_search_iteration_input, 
-    max_query_per_iter_input, 
-    llm_provider, 
-    llm_model_name, 
-    llm_temperature, 
-    llm_base_url, 
-    llm_api_key, 
-    use_vision, 
-    use_own_browser, 
-    headless,        
-    tool_calling_method, 
-    login=None 
+    research_task,
+    max_search_iteration_input,
+    max_query_per_iter_input,
+    llm_provider,
+    llm_model_name,
+    llm_temperature,
+    llm_base_url,
+    llm_api_key,
+    use_vision,
+    use_own_browser,
+    headless,
+    tool_calling_method,
+    login=None
 ):
-    from src.utils.deep_research import deep_research 
+    from src.utils.deep_research import deep_research
     global _global_agent_state
 
     _global_agent_state.clear_stop()
-    
+
     llm = utils.get_llm_model(
         provider=llm_provider,
         model_name=llm_model_name,
@@ -983,20 +983,20 @@ async def run_deep_search(
         base_url=llm_base_url,
         api_key=llm_api_key
     )
-                                                                       
+
     markdown_content, file_path = await deep_research(
-        research_task, 
-        llm, 
+        research_task,
+        llm,
         _global_agent_state,
         max_search_iterations=int(max_search_iteration_input),
         max_query_num=int(max_query_per_iter_input),
-        use_vision=use_vision, 
-        headless=headless,     
-        use_own_browser=use_own_browser 
+        use_vision=use_vision,
+        headless=headless,
+        use_own_browser=use_own_browser
     )
-    
-    return markdown_content, file_path, gr.update(value="Stop", interactive=True), gr.update(interactive=True) 
-    
+
+    return markdown_content, file_path, gr.update(value="Stop", interactive=True), gr.update(interactive=True)
+
 
 def create_ui(config, theme_name="Ocean"):
     css = """
@@ -1013,15 +1013,15 @@ def create_ui(config, theme_name="Ocean"):
             with gr.TabItem("⚙️ Agent Settings", id=1):
                 with gr.Group():
                     agent_type = gr.Radio(["org", "custom"], label="Agent Type", value=config.get('agent_type', 'custom'), info="Select agent type") # pen_test type is handled internally now
-                    with gr.Column(): 
+                    with gr.Column():
                         max_steps = gr.Slider(1, 200, value=config.get('max_steps', 50), step=1, label="Max Run Steps", info="Max steps per agent run")
                         max_actions_per_step = gr.Slider(1, 20, value=config.get('max_actions_per_step', 3), step=1, label="Max Actions per Step", info="Max actions per LLM call")
                     with gr.Column():
                         use_vision = gr.Checkbox(label="Use Vision", value=config.get('use_vision', True), info="Enable visual processing")
                         tool_calling_method = gr.Dropdown(
                             label="Tool Calling Method", value=config.get('tool_calling_method', 'auto'),
-                            interactive=True, allow_custom_value=False, 
-                            choices=["auto", "json_schema", "function_calling"], 
+                            interactive=True, allow_custom_value=False,
+                            choices=["auto", "json_schema", "function_calling"],
                             info="Method for LLM tool invocation (if supported)",
                         )
 
@@ -1061,10 +1061,10 @@ def create_ui(config, theme_name="Ocean"):
                 add_infos = gr.Textbox(label="Additional Information (Optional)", lines=3, placeholder="E.g., login credentials, specific URLs, context...", info="Hints for the LLM")
                 with gr.Row():
                     run_button = gr.Button("▶️ Run Agent", variant="primary", scale=2)
-                    stop_button = gr.Button("⏹️ Stop Agent", variant="stop", scale=1) 
-                with gr.Row(): 
+                    stop_button = gr.Button("⏹️ Stop Agent", variant="stop", scale=1)
+                with gr.Row():
                     browser_view = gr.HTML(value="<div style='width:80vw; height:50vh; display:flex; align-items:center; justify-content:center; border:1px solid #ccc;'><h1>Waiting for browser session...</h1></div>", label="Live Browser View (Headless Only)")
-            
+
             with gr.TabItem("🧐 Deep Research", id=5):
                 research_task_input = gr.Textbox(label="Research Task", lines=5, value=config.get('research_task',"Compose a report on the use of Reinforcement Learning for training Large Language Models..."))
                 with gr.Row():
@@ -1072,12 +1072,12 @@ def create_ui(config, theme_name="Ocean"):
                     max_query_per_iter_input = gr.Number(label="Max Queries per Iteration", value=config.get('max_queries_per_iteration',1), precision=0)
                 with gr.Row():
                     research_button = gr.Button("▶️ Run Deep Research", variant="primary", scale=2)
-                    stop_research_button = gr.Button("⏹️ Stop Research", variant="stop", scale=1) 
+                    stop_research_button = gr.Button("⏹️ Stop Research", variant="stop", scale=1)
                 markdown_output_display = gr.Markdown(label="Research Report")
                 markdown_download = gr.File(label="Download Research Report (Markdown)")
 
 
-            with gr.TabItem("📊 Agent Results", id=6): 
+            with gr.TabItem("📊 Agent Results", id=6):
                 with gr.Group():
                     recording_display = gr.Video(label="Latest Recording")
                     gr.Markdown("### Agent Execution Details")
@@ -1090,7 +1090,7 @@ def create_ui(config, theme_name="Ocean"):
                     with gr.Row():
                         trace_file = gr.File(label="Download Playwright Trace")
                         agent_history_file = gr.File(label="Download Agent History")
-            
+
             # <<< BEGIN MODIFICATION: Web Penetration Testing Tab >>>
             with gr.TabItem("🛡️ Web Penetration Testing", id=10): # New Tab ID
                 gr.Markdown(
@@ -1105,10 +1105,10 @@ def create_ui(config, theme_name="Ocean"):
                     pen_test_types_checkboxes = gr.CheckboxGroup(
                         label="Select Test Categories",
                         choices=[
-                            "Information Gathering", 
-                            "Security Headers", 
-                            "XSS (Analyze & Describe)", 
-                            "SQLi (Analyze & Describe)", 
+                            "Information Gathering",
+                            "Security Headers",
+                            "XSS (Analyze & Describe)",
+                            "SQLi (Analyze & Describe)",
                             "Exposed Paths/Files"
                         ],
                         value=["Information Gathering", "Security Headers"], # Default selection
@@ -1116,7 +1116,7 @@ def create_ui(config, theme_name="Ocean"):
                     )
                     pen_test_run_button = gr.Button("🚀 Start Web Test", variant="primary")
                     pen_test_stop_button = gr.Button("⏹️ Stop Web Test", variant="stop") # For consistency
-                
+
                 pen_test_report_output = gr.Textbox(label="Web Test Report & Logs", lines=20, interactive=False, placeholder="LLM analysis and findings will appear here...")
 
                 # Event handler for the Web Pen Test button
@@ -1125,7 +1125,7 @@ def create_ui(config, theme_name="Ocean"):
                     inputs=[
                         gr.Textbox(value="pen_test", visible=False), # agent_type
                         llm_provider, llm_model_name, llm_temperature, llm_base_url, llm_api_key,
-                        use_own_browser, keep_browser_open, 
+                        use_own_browser, keep_browser_open,
                         gr.Checkbox(value=True, visible=False), # headless (always true for pen_test analysis)
                         disable_security, window_w, window_h,
                         gr.Textbox(value=None, visible=False), # save_recording_path
@@ -1136,7 +1136,7 @@ def create_ui(config, theme_name="Ocean"):
                         gr.Textbox(value=None, visible=False), # add_infos (not used directly)
                         max_steps, # Max steps for the LLM's analysis
                         gr.Checkbox(value=False, visible=False), # use_vision (false for pen_test)
-                        max_actions_per_step, 
+                        max_actions_per_step,
                         tool_calling_method,
                         pen_test_target_url_input, # Specific to pen_test
                         pen_test_types_checkboxes  # Specific to pen_test
@@ -1163,9 +1163,9 @@ def create_ui(config, theme_name="Ocean"):
             # <<< END MODIFICATION >>>
 
 
-            with gr.TabItem("🛠️ Network Tools", id=9): 
+            with gr.TabItem("🛠️ Network Tools", id=9):
                 gr.Markdown("## Network Diagnostic Suite")
-                with gr.Tabs() as network_tool_tabs: 
+                with gr.Tabs() as network_tool_tabs:
                     with gr.TabItem("Ping"):
                         with gr.Row():
                             ping_target_ip_webui = gr.Textbox(label="Target IP", placeholder="e.g., 8.8.8.8 or google.com")
@@ -1175,8 +1175,8 @@ def create_ui(config, theme_name="Ocean"):
                         ping_output_webui = gr.Textbox(label="Ping Output", lines=10, interactive=False)
                         ping_button_webui = gr.Button("Ping")
                         ping_button_webui.click(
-                            ping_skill_webui, 
-                            inputs=[ping_target_ip_webui, ping_packet_size_webui, ping_count_webui, ping_timeout_webui], 
+                            ping_skill_webui,
+                            inputs=[ping_target_ip_webui, ping_packet_size_webui, ping_count_webui, ping_timeout_webui],
                             outputs=ping_output_webui
                         )
 
@@ -1295,19 +1295,19 @@ def create_ui(config, theme_name="Ocean"):
                         route_table_button_webui.click(route_table_skill_webui, inputs=[], outputs=route_table_output_webui)
 
 
-            with gr.TabItem("🎥 Recordings Gallery", id=7): 
+            with gr.TabItem("🎥 Recordings Gallery", id=7):
                 def list_recordings(path):
                     if not path or not os.path.exists(path): return []
                     recordings = glob.glob(os.path.join(path, "*.[mM][pP]4")) + \
                                  glob.glob(os.path.join(path, "*.[wW][eE][bB][mM]"))
-                    recordings.sort(key=os.path.getmtime, reverse=True) 
+                    recordings.sort(key=os.path.getmtime, reverse=True)
                     return [(rec, os.path.basename(rec)) for rec in recordings]
 
                 recordings_gallery = gr.Gallery(label="Session Recordings", value=list_recordings(config.get('save_recording_path')), columns=3, height="auto", object_fit="contain", type="filepath")
                 refresh_button = gr.Button("🔄 Refresh Recordings", variant="secondary")
                 refresh_button.click(fn=list_recordings, inputs=save_recording_path, outputs=recordings_gallery)
-            
-            with gr.TabItem("📁 Configuration Management", id=8): 
+
+            with gr.TabItem("📁 Configuration Management", id=8):
                 with gr.Group():
                     config_file_input = gr.File(label="Load Config From .pkl File", file_types=[".pkl"], interactive=True)
                     load_config_button = gr.Button("Load Config", variant="secondary")
@@ -1316,29 +1316,29 @@ def create_ui(config, theme_name="Ocean"):
 
                 load_config_button.click(
                     fn=update_ui_from_config, inputs=[config_file_input],
-                    outputs=[ 
+                    outputs=[
                         agent_type, max_steps, max_actions_per_step, use_vision, tool_calling_method,
                         llm_provider, llm_model_name, llm_temperature, llm_base_url, llm_api_key,
                         use_own_browser, keep_browser_open, headless, disable_security, enable_recording,
                         window_w, window_h, save_recording_path, save_trace_path, save_agent_history_path,
-                        task, config_status 
+                        task, config_status
                     ]
                 )
                 save_config_button.click(
                     fn=save_current_config,
-                    inputs=[ 
+                    inputs=[
                         agent_type, max_steps, max_actions_per_step, use_vision, tool_calling_method,
                         llm_provider, llm_model_name, llm_temperature, llm_base_url, llm_api_key,
                         use_own_browser, keep_browser_open, headless, disable_security,
                         enable_recording, window_w, window_h, save_recording_path, save_trace_path,
-                        save_agent_history_path, task, 
-                    ],  
+                        save_agent_history_path, task,
+                    ],
                     outputs=[config_status]
                 )
         # Event handlers for Agent Results tab (moved outside the tab definition for clarity)
         stop_button.click(
             fn=stop_agent, inputs=[],
-            outputs=[errors_output, stop_button, run_button] 
+            outputs=[errors_output, stop_button, run_button]
         )
         run_button.click(
             fn=run_with_stream, # This now handles agent_type="org" or "custom"
@@ -1350,36 +1350,36 @@ def create_ui(config, theme_name="Ocean"):
                 enable_recording, task, add_infos, max_steps, use_vision, max_actions_per_step, tool_calling_method,
                 # pen_test_target_url and pen_test_selected_tests are None for this call
             ],
-            outputs=[ 
+            outputs=[
                 browser_view, final_result_output, errors_output, model_actions_output,
                 model_thoughts_output, recording_display, trace_file, agent_history_file,
                 stop_button, run_button
             ],
         )
-        
+
         research_button.click(
             fn=run_deep_search,
-            inputs=[ 
-                research_task_input, max_search_iteration_input, max_query_per_iter_input, 
-                llm_provider, llm_model_name, llm_temperature, llm_base_url, llm_api_key, 
-                use_vision, use_own_browser, headless, tool_calling_method 
+            inputs=[
+                research_task_input, max_search_iteration_input, max_query_per_iter_input,
+                llm_provider, llm_model_name, llm_temperature, llm_base_url, llm_api_key,
+                use_vision, use_own_browser, headless, tool_calling_method
             ],
             outputs=[markdown_output_display, markdown_download, stop_research_button, research_button]
         )
         stop_research_button.click(
             fn=stop_research_agent, inputs=[],
-            outputs=[stop_research_button, research_button], 
+            outputs=[stop_research_button, research_button],
         )
 
 
         llm_provider.change(
-            fn=update_model_dropdown, 
-            inputs=[llm_provider, llm_api_key, llm_base_url], 
+            fn=update_model_dropdown,
+            inputs=[llm_provider, llm_api_key, llm_base_url],
             outputs=llm_model_name
         )
         enable_recording.change(lambda enabled: gr.update(interactive=enabled), inputs=enable_recording, outputs=save_recording_path)
-        
-        use_own_browser.change(fn=close_global_browser) 
+
+        use_own_browser.change(fn=close_global_browser)
         keep_browser_open.change(fn=lambda kbo: asyncio.ensure_future(close_global_browser()) if not kbo else None, inputs=[keep_browser_open])
 
 
@@ -1392,13 +1392,13 @@ def main():
     parser.add_argument("--theme", type=str, default="Ocean", choices=list(theme_map.keys()), help="Theme for UI")
     args = parser.parse_args()
 
-    config_dict = default_config() 
-    
+    config_dict = default_config()
+
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
     logger.info("Starting Browser Use WebUI...")
-    
+
     demo_instance = create_ui(config_dict, theme_name=args.theme)
-    demo_instance.queue().launch(server_name=args.ip, server_port=args.port, share=os.getenv("GRADIO_SHARE", "False").lower() == "true")
+    demo_instance.queue().launch(server_name=args.ip, server_port=args.port, share=os.getenv("GRADIO_SHARE", "True").lower() == "true")
 
 if __name__ == '__main__':
     try:
